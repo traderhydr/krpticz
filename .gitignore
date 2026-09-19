@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+state_*.json
+.backtest_cache/
+.backtest_scratch/
+*.xlsx
