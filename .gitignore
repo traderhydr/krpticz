@@ -1,7 +1,12 @@
+.env
 .venv/
 __pycache__/
 *.pyc
-state_*.json
+cooldown.json
+cooldown_gem.json
+risk_state.json
+*_risk_state.json
+backtest_report*.xlsx
+*_raw.json
 .backtest_cache/
 .backtest_scratch/
-*.xlsx

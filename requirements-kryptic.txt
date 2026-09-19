@@ -1,0 +1,14 @@
+-r requirements.txt
+pandas>=2.0.0
+# pandas_ta will be added here once a later KRYPTIC step actually calls into it
+# (e.g. ADX/SuperTrend for the trend filter). It requires Python >=3.12 on PyPI
+# as of this writing -- confirm the target machine's Python version before
+# relying on it. Step 1 (indicators.py) needed none of its indicators, so it
+# isn't pulled in yet.
+websockets>=12.0
+# Used by live_runner.py's LiveExchangeStream.stream_klines (Step 10) --
+# the real WS client. Not needed to run this repo's test suite, which only
+# exercises live_runner.py against data_collector.MockExchangeStream.
+openpyxl>=3.1.0
+# Used by backtest_engine.py's BacktestReport.export_excel() (institutional
+# multi-tab Excel report) via pandas.ExcelWriter(engine="openpyxl").

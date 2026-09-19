@@ -1,0 +1,11 @@
+cd zenithupdated
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+# Default profile: STRATEGY_PROFILE=smc_lite (see .env.example)
+python bot.py
+
+Windows:
+  py -3 -m venv .venv
+  .venv\Scripts\activate
+  pip install -r requirements.txt
+  python bot.py

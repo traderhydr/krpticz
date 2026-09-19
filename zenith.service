@@ -1,0 +1,14 @@
+[Unit]
+Description=Zenith signal bot
+After=network-online.target
+
+[Service]
+User=YOUR_LINUX_USER
+WorkingDirectory=/home/YOUR_LINUX_USER/zenithupdated
+ExecStart=/home/YOUR_LINUX_USER/zenithupdated/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
