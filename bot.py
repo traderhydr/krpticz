@@ -349,8 +349,6 @@ async def scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, univer
 
     async def score_one(t: dict):
         symbol = t["symbol"]
-        if not cool.ready(f"sym:{symbol}"):
-            return
         async with sem:
             try:
                 scored = await evaluate_one(client, symbol, dict(t), cfg, btc_regime=btc_regime)
@@ -363,6 +361,10 @@ async def scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, univer
             return
         if not cfg.get("allow_shorts", True) and scored["side"] != "LONG":
             return
+        # Cooldown is per (symbol, side): a repeat signal in the SAME
+        # direction on the same symbol is blocked until it expires, but the
+        # OPPOSITE direction is never blocked by it -- a fresh reversal
+        # posts immediately instead of waiting out the other side's cooldown.
         if not cool.ready(f"side:{symbol}:{scored['side']}"):
             return
         fib = scored.get("fib") or {}
@@ -435,7 +437,6 @@ async def scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, univer
             except Exception as e:
                 log.error("telegram %s: %s", symbol, e)
                 continue
-        await cool.hit(f"sym:{symbol}")
         await cool.hit(f"side:{symbol}:{sig.side}")
         risk.open_trade(
             symbol=symbol,
@@ -497,8 +498,6 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
 
     async def score_one(t: dict):
         symbol = t["symbol"]
-        if not cool.ready(f"gem:{symbol}"):
-            return
         async with sem:
             try:
                 result = await evaluate_one_gem(client, symbol, cfg)
@@ -506,6 +505,10 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
                 log.warning("gem scan %s failed: %s", symbol, e)
                 return
         if not result:
+            return
+        # Cooldown is per (symbol, direction) -- see scan_once()'s own
+        # comment: a same-direction repeat is blocked, a reversal isn't.
+        if not cool.ready(f"gem:{symbol}:{result['dir']}"):
             return
         lev = leverage_from_quality(
             result["nota"],
@@ -548,7 +551,7 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
             except Exception as e:
                 log.error("telegram %s: %s", symbol, e)
                 continue
-        await cool.hit(f"gem:{symbol}")
+        await cool.hit(f"gem:{symbol}:{sig.side}")
         risk.open_trade(
             symbol=symbol,
             side=sig.side,
@@ -624,8 +627,6 @@ async def kryptic_scan_once(
 
     async def score_one(t: dict):
         symbol = t["symbol"]
-        if not cool.ready(f"kryptic:{symbol}"):
-            return
         async with sem:
             try:
                 result = await evaluate_one_kryptic(client, symbol, cfg, btc_df, trade_manager)
@@ -635,6 +636,10 @@ async def kryptic_scan_once(
         if not result:
             return
         position = result["position"]
+        # Cooldown is per (symbol, direction) -- see scan_once()'s own
+        # comment: a same-direction repeat is blocked, a reversal isn't.
+        if not cool.ready(f"kryptic:{symbol}:{position.direction}"):
+            return
         lev = leverage_from_quality(
             kryptic.KRYPTIC_CFG["SCORE"],
             side=position.direction,
@@ -679,7 +684,7 @@ async def kryptic_scan_once(
             except Exception as e:
                 log.error("telegram %s: %s", symbol, e)
                 continue
-        await cool.hit(f"kryptic:{symbol}")
+        await cool.hit(f"kryptic:{symbol}:{sig.side}")
         risk.open_trade(
             symbol=symbol,
             side=sig.side,

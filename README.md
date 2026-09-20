@@ -37,7 +37,12 @@ portfolio drawdown ceiling:
 
 All three engines scan on the same `SCAN_SECONDS` cadence, post to the same
 `TELEGRAM_CHANNEL_ID`, and share cooldown bookkeeping only *within* each
-engine (a symbol can signal once per engine independently) — but share one
+engine (a symbol can signal once per engine independently). Each engine's
+cooldown is keyed per **(symbol, direction)**, not just per symbol: a
+same-direction repeat on the same coin is blocked until `COOLDOWN_MINUTES`/
+`GEM_COOLDOWN_MINUTES`/`KRYPTIC_COOLDOWN_MINUTES` elapses, but a fresh
+signal in the *opposite* direction on that same coin is never blocked by
+it — it posts as soon as the engine finds one. Engines still share one
 `RiskGuard` instance, so combined simulated drawdown across all three
 strategies gates new signals from any of them. See `.env.example`'s GEM and
 KRYPTIC sections for every tunable knob.
