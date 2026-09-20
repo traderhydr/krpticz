@@ -633,7 +633,7 @@ class ZeroWeightPhantomPositionTests(unittest.TestCase):
         filled_tiers = {e["tier_index"] for e in log if e["type"] == "ENTRY_FILL"}
         self.assertEqual(filled_tiers, {0, 1, 3})
         self.assertIsNotNone(pos.weighted_avg_entry)
-        self.assertAlmostEqual(pos.open_size, 0.80, places=6)  # 0.40 + 0.30 + 0.10 (entry4, now active)
+        self.assertAlmostEqual(pos.open_size, 0.90, places=6)  # 0.70 + 0.10 + 0.10 (entries 1/2/4; entry3 blocked)
 
 
 class TpHitBeforeAnyEntryFillTests(unittest.TestCase):

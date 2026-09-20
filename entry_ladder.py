@@ -36,16 +36,16 @@ from regime_filter import RegimeFilter
 
 Direction = Literal["LONG", "SHORT"]
 
-LADDER_WEIGHTS: tuple[float, float, float, float] = (0.40, 0.30, 0.20, 0.10)
-"""All 4 tiers active, front-loaded toward the shallower fills (matching
-ZENITH's/GEM's own ENTRY_WEIGHTS front-loading, for a consistent ladder
-shape across all three engines): Entry 1 dominant (breakout/FVG-proximal,
-0.40), Entry 2 a shallow 0.382-0.50 retracement (0.30), Entry 3 a deeper
-0.618-0.705 retracement (0.20), Entry 4 the origin-sweep/ATR-band tier
-(0.10) -- previously 0-weighted ("effectively disabled") since this
-profile doesn't wait for a full liquidity sweep back to the impulse
-origin; kept active now so a real liquidity sweep back to origin still
-adds size instead of being ignored."""
+LADDER_WEIGHTS: tuple[float, float, float, float] = (0.70, 0.10, 0.10, 0.10)
+"""All 4 tiers active, matching this account's real Cornix ladder split
+(70/10/10/10 -- see ENTRY_WEIGHTS/GEM_ENTRY_WEIGHTS in .env.example for the
+same split on ZENITH/GEM, kept consistent across all three engines): Entry
+1 dominant (breakout/FVG-proximal, 0.70), Entry 2 a shallow 0.382-0.50
+retracement (0.10), Entry 3 a deeper 0.618-0.705 retracement (0.10), Entry
+4 the origin-sweep/ATR-band tier (0.10) -- previously 0-weighted
+("effectively disabled") since this profile doesn't wait for a full
+liquidity sweep back to the impulse origin; kept active now so a real
+liquidity sweep back to origin still adds size instead of being ignored."""
 ENTRY3_TIER_INDEX = 2  # the bar-delta-gated tier, fixed by the 4-tier spec
 
 

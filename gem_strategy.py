@@ -53,7 +53,7 @@ GEM_CFG: dict = {
     "EQUAL_ENTRIES": True,
     "WEIGHT_E1": 0.40,
     "WEIGHT_E2": 0.60,
-    "ENTRY_WEIGHTS": [0.40, 0.30, 0.20, 0.10],  # 4-entry ladder weights (E1..E4)
+    "ENTRY_WEIGHTS": [0.70, 0.10, 0.10, 0.10],  # 4-entry ladder weights (E1..E4) -- matches real Cornix split
 
     "REACH_MAX_ATR": 1.2,     # E1 never further than this from current price
     "ENTRY_MAX_ATR": 99.0,

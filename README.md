@@ -49,21 +49,23 @@ KRYPTIC sections for every tunable knob.
 
 ## Price data source (Cornix mismatch fix)
 
-Both strategies and `RiskGuard` fetch tickers/candles/funding through
-`exchanges.resolve_source()`, which reads `DATA_SOURCE` from `.env`:
+All three engines and `RiskGuard` fetch tickers/candles/funding through
+`exchanges.resolve_source()`, which reads `DATA_SOURCE` from `.env` (bot.py
+resolves it once and every engine shares the same functions):
 
-- **`blofin`** (default) — BloFin only, no cross-venue fallback. Every
-  symbol the bot scans is confirmed actually listed on BloFin, and every
-  price a signal is built from is BloFin's own — so if your Cornix account
-  executes on BloFin, there's no cross-exchange price/listing mismatch
-  between what gets posted and what Cornix fills.
-- **`binance`** — the original Binance → MEXC → Bitget fallback chain
-  (broader universe, more historical depth), for a Cornix account that
-  executes somewhere else, or when exact-venue matching doesn't matter.
+- **`blofin`** — BloFin only, no cross-venue fallback. Every symbol the bot
+  scans is confirmed actually listed on BloFin, and every price a signal is
+  built from is BloFin's own — so if your Cornix account executes on
+  BloFin, there's no cross-exchange price/listing mismatch between what
+  gets posted and what Cornix fills.
+- **`binance`** (this account's setting) — the original Binance → MEXC →
+  Bitget fallback chain (broader universe, more historical depth), for a
+  Cornix account that executes on Binance.
 
-Switching `DATA_SOURCE` moves ZENITH, GEM, *and* `RiskGuard`'s drawdown
-replay together — RiskGuard replaying a BloFin-priced trade against Binance
-candles would just reintroduce the same mismatch one level down.
+Switching `DATA_SOURCE` moves ZENITH, GEM, KRYPTIC, *and* `RiskGuard`'s
+drawdown replay together — RiskGuard replaying a Binance-priced trade
+against BloFin candles (or vice versa) would just reintroduce the same
+mismatch one level down.
 
 BloFin's public API doesn't publish a documented funding-rate ticker field
 or a per-symbol max-leverage endpoint, so under `DATA_SOURCE=blofin`,
