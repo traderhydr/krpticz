@@ -1,7 +1,7 @@
-# ZENITH + GEM (two-strategy Telegram signal bot)
+# ZENITH + GEM + KRYPTIC (three-strategy Telegram signal bot)
 
-Telegram / Cornix signal bot running **two independent strategy engines** in
-one process, one chat, one Telegram bot token, and one shared `RiskGuard`
+Telegram / Cornix signal bot running **three independent strategy engines**
+in one process, one chat, one Telegram bot token, and one shared `RiskGuard`
 portfolio drawdown ceiling:
 
 - **ZENITH** (`strategy.py`) — default live profile **`smc_lite`**: HTF BOS /
@@ -11,18 +11,36 @@ portfolio drawdown ceiling:
 - **GEM** (`gem_strategy.py`) — Fibonacci-retracement entries (79% pullback
   of a recent impulse leg), ATR-based stop, R-based quality filters, SMC
   (structure/FVG/order-block/liquidity-sweep) confluence measurements. A
-  faithful Python port of an uploaded `motor-gem.js` engine, cross-checked
-  numerically against the original Node implementation (see
-  "Porting notes" below). Signals post as `GEM SIGNAL` instead of `ZENITH
-  SIGNAL` so the two are easy to tell apart in the channel; toggle with
-  `GEM_ENABLED` in `.env`.
+  Python port of an uploaded `motor-gem.js` engine, cross-checked
+  numerically against the original Node implementation for its core E1/E2/E3
+  and TP1/TP2/TP3 math (see "Porting notes" below) — a 4th entry tier and 2
+  more take-profits were added on top of that verified port so GEM posts the
+  same 4-entry/5-TP shape as ZENITH and KRYPTIC. Signals post as `GEM SIGNAL`
+  instead of `ZENITH SIGNAL` so the two are easy to tell apart in the
+  channel; toggle with `GEM_ENABLED` in `.env`.
+- **KRYPTIC** (`kryptic_strategy.py`, over `entry_ladder.py`/
+  `regime_filter.py`/`directional_bias.py`/`risk_manager.py`) — a 4-tier
+  scale-in entry ladder (breakout/FVG-proximal, two Fibonacci retracement
+  tiers, a liquidity-sweep/ATR-band tier), gated by `RegimeFilter` +
+  `DirectionEngine`, with 5 fixed ATR-multiple take-profits re-anchored to
+  the real filled VWAP every bar. Unlike ZENITH/GEM, its own entry gate is
+  pass/fail rather than a continuous quality score. This module is a
+  Telegram-signal adapter around the same synchronous pieces
+  `engine.py`'s `KrypticEngine` (the persistent, websocket-driven,
+  crash-recoverable engine used by `multi_strategy_manager.py`'s hedge-mode
+  harness) is built from — it posts signals the same way ZENITH/GEM do
+  rather than running that full streaming engine. Toggle with
+  `KRYPTIC_ENABLED` in `.env`.
 
-Both engines scan on the same `SCAN_SECONDS` cadence, post to the same
+**All three engines now post the same signal shape: 4 scale-in entries and
+5 take-profit targets.**
+
+All three engines scan on the same `SCAN_SECONDS` cadence, post to the same
 `TELEGRAM_CHANNEL_ID`, and share cooldown bookkeeping only *within* each
 engine (a symbol can signal once per engine independently) — but share one
-`RiskGuard` instance, so combined simulated drawdown across both strategies
-gates new signals from either one. See `.env.example`'s GEM section for
-every tunable knob.
+`RiskGuard` instance, so combined simulated drawdown across all three
+strategies gates new signals from any of them. See `.env.example`'s GEM and
+KRYPTIC sections for every tunable knob.
 
 ## Price data source (Cornix mismatch fix)
 
@@ -214,6 +232,15 @@ against a live API).
   `GEM_R_MAX_PCT`) via a generic, type-aware override loader in
   `bot.py:configure_gem_strategy()` — no per-field boilerplate to keep in
   sync.
+- **Deviation from the port (KRPTICZ 4-entry/5-TP standardization):** the
+  original `evaluar()`'s default entry path built 3 entries (E1/E2/E3) and
+  `CFG.TP`/`CFG.CLOSES` had 3 take-profit tiers. A 4th entry (`E4`, gated by
+  `GEM_CFG["E4_FRACTION"]`/`GEM_CFG["ENTRY_WEIGHTS"]`) and 2 more
+  take-profits (`TP4`/`TP5`, via `TP`/`CLOSES` now holding 5 values each)
+  were added so GEM posts the same 4-entry/5-TP signal shape as ZENITH and
+  KRYPTIC. This is the one place `gem_strategy.py` is no longer numerically
+  identical to `motor-gem.js` — every other rejection code, gate, and the
+  E1/E2/E3/TP1/TP2/TP3 math below remain the original, verified port.
 - Numerically verified against the original: a comparison harness ran both
   `motor-gem.js`'s `evaluar()` (Node) and `gem_strategy.evaluate()` (Python)
   over identical synthetic candle series — random-walk scenarios (uptrend,
@@ -236,6 +263,49 @@ against a live API).
   not off `E1` the way ZENITH does — so unlike ZENITH's `build_signal`
   (which must use `abs(E1-SL)` as its R unit for `RiskGuard`), GEM's R unit
   is exactly `abs(Eavg-SL)`, matching how its own TPs were built.
+
+## KRYPTIC (`kryptic_strategy.py`)
+
+Third strategy engine, standing on top of the KRYPTIC track's own modules
+(`entry_ladder.py`, `regime_filter.py`, `directional_bias.py`,
+`risk_manager.py`) that predate this repo's Telegram-signal bot and were
+originally built for `engine.py`'s `KrypticEngine` — a persistent,
+websocket-driven, crash-recoverable position-tracking engine used by
+`multi_strategy_manager.py`'s hedge-mode harness, a different architecture
+from ZENITH/GEM's one-shot-per-scan `evaluate()`/`build_signal()` functions.
+Building a real order-executing bridge between that engine and this bot is
+a separate, much larger undertaking (see `multi_strategy_manager.py`'s own
+"honest scope note").
+
+`kryptic_strategy.py` instead reuses the same synchronous, pandas-based
+pieces `KrypticEngine` itself is built from — `EntryLadderEngine`/
+`RegimeFilter`/`DirectionEngine` via `TradeLifecycleManager.open_trade()` —
+directly against the closed-candle DataFrame `bot.py` already fetches each
+scan, exactly the way ZENITH/GEM's own `evaluate()` functions do. So, like
+ZENITH and GEM, KRYPTIC here only ever posts a signal to Telegram/Cornix and
+hands it to the shared `RiskGuard` for its own independent replay — it never
+opens or tracks a persistent position the way `KrypticEngine` does.
+
+**4-entry/5-TP standardization:**
+- `entry_ladder.py`'s `LADDER_WEIGHTS` changed from `(0.40, 0.35, 0.25,
+  0.0)` (3 active tiers — the origin-sweep/ATR-band Entry 4 was
+  0-weighted, "effectively disabled") to `(0.40, 0.30, 0.20, 0.10)`, all 4
+  tiers now carrying real size.
+- `risk_manager.py`'s `TP_WEIGHTS` changed from `(0.20, 0.50, 0.0, 0.0,
+  0.0)` (2 fixed targets, with the remaining 0.30 going to an ATR
+  chandelier-trail runner tier instead of a 3rd fixed target) to `(0.20,
+  0.30, 0.20, 0.15, 0.15)` — 5 real, fixed-price targets, all re-anchored
+  to the real filled VWAP every bar the same way TP1/TP2 always were. The
+  trailing-runner mechanism (`PositionState.runner_weight`, default now
+  `0.0`) still exists and works exactly as before for a caller who
+  explicitly reconfigures `tp_weights` toward the legacy 2-target-plus-
+  runner geometry.
+- Since KRYPTIC has no continuous quality score (its `RegimeFilter`/
+  `DirectionEngine` gate is pass/fail), `kryptic_strategy.KRYPTIC_CFG
+  ["SCORE"]` (default 75) is a fixed value that only feeds
+  `leverage_from_quality`'s score-to-leverage mapping and `bot.py`'s
+  cross-candidate ranking within one scan — it never gates whether a setup
+  is taken.
 
 ## Run (Google Cloud VM)
 

@@ -152,19 +152,19 @@ log = logging.getLogger(__name__)
 
 Direction = Literal["LONG", "SHORT"]
 
-TP_WEIGHTS: tuple[float, float, float, float, float] = (0.20, 0.50, 0.0, 0.0, 0.0)
-"""Step 11.2 geometry, locked in from grid_resimulation.py's real-price-path
-sweep: TP1 20% at 1.10 ATR, TP2 50% at 2.80 ATR, both off the real filled
-VWAP -- the remaining 30% (`PositionState.runner_weight`, NOT part of this
-tuple) goes to the new ATR chandelier-trail runner tier once both TP1 and
-TP2 have fired. TP1+TP2 deliberately do NOT sum to 1.0 anymore (0.70,
-not 1.0) -- `PositionState.__post_init__` validates
-`sum(tp_weights) + runner_weight == 1.0` instead. Slots 3/4/5 stay
-reserved (`None` price, 0 weight) rather than removed, so the 5-element
-list shape this module and its callers have always assumed doesn't need
-to change -- the runner is NOT tp_levels[2]/tp_weights[2] (a fixed price
-target doesn't fit a dynamically-trailing exit; see `runner_weight`/
-`runner_trail_atr_mult`/`runner_active`/`runner_extreme` instead)."""
+TP_WEIGHTS: tuple[float, float, float, float, float] = (0.20, 0.30, 0.20, 0.15, 0.15)
+"""5 real, fixed-price targets (all off the real filled VWAP, same as the
+original TP1/TP2): TP1 20% at 1.10 ATR, TP2 30% at 2.80 ATR, TP3 20% at
+4.20 ATR, TP4 15% at 5.60 ATR, TP5 15% at 7.00 ATR -- sums to 1.0, so
+`PositionState.runner_weight` defaults to 0.0 (the trailing-runner tier
+this module used to reserve the remainder for is no longer engaged by
+default; it's kept as an opt-in mechanism -- see `runner_weight`'s own
+docstring -- for a caller who explicitly wants to trade some of TP3-5's
+fixed targets back for an open-ended trail again). Previously (Step 11.2)
+this tuple was (0.20, 0.50, 0.0, 0.0, 0.0) with TP3/4/5 permanently unused
+placeholders and the remaining 0.30 going to the runner; that geometry is
+still fully supported by passing these same values explicitly, it's just
+no longer the default."""
 
 
 @dataclass
@@ -190,14 +190,15 @@ class PositionState:
         current_sl: The ACTIVE stop -- starts equal to initial_sl, migrates
             once (see `scratch_win_trigger_atr_mult`) to a small-guaranteed-
             win level once price has moved far enough in profit.
-        tp_levels: [tp1, tp2, tp3, tp4, tp5] target prices. tp3/tp4/tp5 are
-            always None -- there is no third static price target (see
-            `TP_WEIGHTS`'s own docstring for why the list still has 5
-            slots, and `runner_weight` below for what actually happens to
-            the size these targets don't account for).
+        tp_levels: [tp1, tp2, tp3, tp4, tp5] target prices -- all 5 are
+            real, fixed price targets by default now (see `TP_WEIGHTS`'s
+            own docstring); a tier's price may still be `None` if a caller
+            explicitly wants fewer than 5 active targets (e.g. the legacy
+            2-target-plus-runner geometry), in which case that tier is
+            simply never checked (see `update`'s step 3).
         tp_weights: Position-size fraction per TP tier (default TP_WEIGHTS,
-            [0.20, 0.50, 0.0, 0.0, 0.0] -- Step 11.0 -- sums to 0.70, NOT
-            1.0; the remainder is `runner_weight`, below).
+            [0.20, 0.30, 0.20, 0.15, 0.15] -- sums to 1.0, so `runner_weight`
+            defaults to 0.0).
         tp_fills: Per-tier completion state (True once that tier has fired,
             even if -- see `update` -- there was no size left open to
             actually close when it did).
@@ -238,17 +239,19 @@ class PositionState:
             original hypothesis for the -0.0177R production regression
             and the re-simulation showed that hypothesis was BACKWARDS,
             see the module docstring's Step 11.2 section).
-        tp1_atr_mult / tp2_atr_mult: TP1/TP2's fixed distance from the real
-            filled VWAP, in ATR14 (defaults 1.10 / 2.80 -- Step 11.2's
-            real-price-path-optimized values, replacing Step 11.0's 0.60
-            / 3.20). Not just a construction-time estimate --
-            `_revalidate_tp_geometry` re-anchors both to this exact
-            multiple of the REAL filled VWAP EVERY bar (Step 10.11; was
-            only on a fresh fill under Step 10.10 -- see
-            `update_entry_fill`'s docstring for why that missed a
-            construction-time-prefilled tier), since the whole point of
-            this design is "always exactly this many ATRs from wherever
-            the real average entry lands," not a one-time guess.
+        tp1_atr_mult / tp2_atr_mult / tp3_atr_mult / tp4_atr_mult /
+            tp5_atr_mult: Each TP's fixed distance from the real filled
+            VWAP, in ATR14 (defaults 1.10 / 2.80 / 4.20 / 5.60 / 7.00).
+            Not just a construction-time estimate -- `_revalidate_tp_geometry`
+            re-anchors every one of them to this exact multiple of the
+            REAL filled VWAP EVERY bar (Step 10.11; was only on a fresh
+            fill under Step 10.10 -- see `update_entry_fill`'s docstring
+            for why that missed a construction-time-prefilled tier), since
+            the whole point of this design is "always exactly this many
+            ATRs from wherever the real average entry lands," not a
+            one-time guess. TP3/4/5 are re-anchored the same unfloored,
+            unclamped way TP2 always has been -- only TP1 carries the
+            extra floor/hard-invariant-clamp machinery below.
         tp1_min_atr_mult: Floor under TP1's distance from the real filled
             VWAP, in ATR14 (default 0.30, unchanged since Step 11.0; well
             below the current 1.10 `tp1_atr_mult` so it never binds --
@@ -258,10 +261,15 @@ class PositionState:
             `max(tp1_atr_mult, tp1_min_atr_mult) * atr`, and also the
             distance the hard invariant clamp forces TP1 to if it is ever
             found on the wrong side of the real filled VWAP.
-        runner_weight: Step 11.0 -- position-size fraction (default 0.30)
-            reserved for the trailing-runner tier: whatever's left after
-            TP1 and TP2's own weights. Unlike tp_weights, this is NOT a
-            fixed price target -- see `runner_trail_atr_mult`.
+        runner_weight: Position-size fraction (default 0.0, now that
+            TP_WEIGHTS' 5 real targets sum to 1.0) reserved for the Step
+            11.0 trailing-runner tier: whatever's left after every
+            tp_weights entry. Unlike tp_weights, this is NOT a fixed price
+            target -- see `runner_trail_atr_mult`. Still fully functional
+            when non-zero (e.g. a caller passing the legacy
+            `TP_WEIGHTS=(0.20, 0.50, 0.0, 0.0, 0.0)` plus `runner_weight=
+            0.30`) -- it just isn't what a default-constructed position
+            uses any more.
         runner_trail_atr_mult: ATR chandelier-trail distance (default 2.0)
             for the runner tier, once active (see `update`'s runner step).
             The trail only ever ratchets favorably (LONG: up only; SHORT:
@@ -300,8 +308,11 @@ class PositionState:
     tp1_atr_mult: float = 1.10
     tp1_min_atr_mult: float = 0.30
     tp2_atr_mult: float = 2.80
+    tp3_atr_mult: float = 4.20
+    tp4_atr_mult: float = 5.60
+    tp5_atr_mult: float = 7.00
     time_decay_bars: int = 6
-    runner_weight: float = 0.30
+    runner_weight: float = 0.0
     runner_trail_atr_mult: float = 2.0
     runner_active: bool = False
     runner_extreme: float | None = None
@@ -314,8 +325,6 @@ class PositionState:
         ):
             if len(seq) != expected_len:
                 raise ValueError(f"{name} must have exactly {expected_len} entries, got {len(seq)}")
-        if self.tp_levels[4] is not None:
-            raise ValueError("tp_levels[4] must be None -- no dynamic runner PRICE target (see runner_weight)")
         total_weight = sum(self.tp_weights) + self.runner_weight
         if abs(total_weight - 1.0) > 1e-6:
             raise ValueError(f"tp_weights + runner_weight must sum to 1.0, got {total_weight}")
@@ -378,7 +387,8 @@ class PositionState:
             self._log(bar_index, "ENTRY_FILL", tier_index=tier_i, price=self.ladder.levels[tier_i], weight=self.ladder.weights[tier_i])
 
     def _revalidate_tp_geometry(self, bar_index: int, *, atr: float | None) -> None:
-        """Re-anchor TP1/TP2 to the REAL filled VWAP, every bar (Step 10.11).
+        """Re-anchor every active TP tier to the REAL filled VWAP, every
+        bar (Step 10.11; extended from TP1/TP2-only to all 5 tiers).
 
         TP1 = filled_vwap +/- max(tp1_atr_mult, tp1_min_atr_mult) * atr --
         a floor under TP1's distance, not just a fixed multiple, so a
@@ -421,6 +431,15 @@ class PositionState:
 
         if not self.tp_fills[1] and self.tp_levels[1] is not None:
             _set_tp(1, filled_vwap + sign * self.tp2_atr_mult * atr)
+
+        if not self.tp_fills[2] and self.tp_levels[2] is not None:
+            _set_tp(2, filled_vwap + sign * self.tp3_atr_mult * atr)
+
+        if not self.tp_fills[3] and self.tp_levels[3] is not None:
+            _set_tp(3, filled_vwap + sign * self.tp4_atr_mult * atr)
+
+        if not self.tp_fills[4] and self.tp_levels[4] is not None:
+            _set_tp(4, filled_vwap + sign * self.tp5_atr_mult * atr)
 
         if not self.tp_fills[0] and self.tp_levels[0] is not None:
             inverted = (self.tp_levels[0] <= filled_vwap) if self.direction == "LONG" else (self.tp_levels[0] >= filled_vwap)
@@ -478,21 +497,23 @@ class PositionState:
                `filled_vwap +/- breakeven_buffer_atr_mult * ATR` -- a
                guaranteed small win if later stopped out, never a bare
                breakeven or worse.
-            3. Passive TP1/TP2 checks, in ascending order, against whatever
-               is open at each check (a single wide bar can trigger both).
-               Either one firing cancels any still-resting entry tier --
-               once the position is in take-profit mode, a later
+            3. Passive TP1-TP5 checks, in ascending order, against whatever
+               is open at each check (a single wide bar can trigger more
+               than one). Any tier firing cancels any still-resting entry
+               tier -- once the position is in take-profit mode, a later
                retracement must never fill a resting order at worse
-               momentum. TP1+TP2 weights sum to 0.70 (Step 11.0), not 1.0
-               -- reaching TP2 leaves `runner_weight` still open, not zero.
+               momentum. tp_weights sum to 1.0 by default now, so reaching
+               TP5 leaves nothing open; `runner_weight` (default 0.0) is
+               only non-zero for a caller who explicitly configures fewer
+               active TP tiers and wants the remainder trailed instead.
             3b. Trailing runner (Step 11.0): once BOTH TP1 and TP2 have
-               fired and size remains (i.e. exactly `runner_weight`, in
-               the normal case), an ATR chandelier stop trails behind the
-               best price seen since -- ratcheting `current_sl` favorably
-               only, same convention as the breakeven buffer. A same-bar
-               hit closes immediately here; a hit on a LATER bar is caught
-               by step 1 above instead (see that step's own comment for
-               why it's then labeled RUNNER_EXIT, not SL_HIT).
+               fired and size remains (only possible if `runner_weight` is
+               non-zero -- see above), an ATR chandelier stop trails
+               behind the best price seen since -- ratcheting `current_sl`
+               favorably only, same convention as the breakeven buffer. A
+               same-bar hit closes immediately here; a hit on a LATER bar
+               is caught by step 1 above instead (see that step's own
+               comment for why it's then labeled RUNNER_EXIT, not SL_HIT).
             3c. Time-decay invalidation: if TP1 still hasn't fired after
                `time_decay_bars` bars and this bar's close is on the wrong
                side of `ema20`, close out at market rather than let a
@@ -550,8 +571,8 @@ class PositionState:
                     self.breakeven_moved = True
                     self._log(idx, "BREAKEVEN_MOVE", new_sl=self.current_sl, filled_vwap=avg_entry)
 
-        # 3. Passive TP1/TP2 checks.
-        for i in range(4):
+        # 3. Passive TP1-TP5 checks.
+        for i in range(5):
             if self.tp_fills[i] or self.tp_levels[i] is None:
                 continue
             level = self.tp_levels[i]
@@ -564,7 +585,7 @@ class PositionState:
                 self._log(idx, "TP_HIT_NO_SIZE", tier_index=i, price=level)
             else:
                 self._close_weight(idx, "TP_HIT", close_amount, level, tier_index=i)
-            # Ladder protection: either target firing puts the position in
+            # Ladder protection: any target firing puts the position in
             # take-profit mode -- cancel any still-resting entry tier so a
             # later retracement can never fill at worse momentum than what
             # already justified taking profit.
@@ -629,12 +650,14 @@ class TradeLifecycleManager:
             15m chop, trading a bigger loss on the (now rarer) full
             stop-outs for a much higher hit rate on the (now closer)
             targets below.
-        tp1_atr_mult / tp2_atr_mult: TP1/TP2's distance from
-            `expected_vwap` at construction (defaults 1.10 / 2.80, Step
-            11.2 -- both real-price-path-optimized, replacing Step 11.0's
-            0.60 / 3.20). `PositionState`'s own copy of these same values
-            re-anchors both to the REAL filled VWAP every bar at runtime
-            -- see `_revalidate_tp_geometry`.
+        tp1_atr_mult / tp2_atr_mult / tp3_atr_mult / tp4_atr_mult /
+            tp5_atr_mult: Each TP's distance from `expected_vwap` at
+            construction (defaults 1.10 / 2.80 / 4.20 / 5.60 / 7.00; TP1/
+            TP2 are Step 11.2's real-price-path-optimized values,
+            replacing Step 11.0's 0.60 / 3.20 -- TP3/4/5 continue that same
+            spacing outward). `PositionState`'s own copy of these same
+            values re-anchors every tier to the REAL filled VWAP every bar
+            at runtime -- see `_revalidate_tp_geometry`.
         tp1_min_atr_mult: Floor under TP1's real-filled-VWAP distance, in
             ATR14 (default 0.30, unchanged since Step 11.0 -- well below
             the current 1.10 `tp1_atr_mult` so it never binds) -- passed
@@ -671,6 +694,9 @@ class TradeLifecycleManager:
         tp1_atr_mult: float = 1.10,
         tp1_min_atr_mult: float = 0.30,
         tp2_atr_mult: float = 2.80,
+        tp3_atr_mult: float = 4.20,
+        tp4_atr_mult: float = 5.60,
+        tp5_atr_mult: float = 7.00,
         runner_trail_atr_mult: float = 2.0,
         breakeven_buffer_atr_mult: float = 0.35,
         scratch_win_trigger_atr_mult: float = 0.60,
@@ -682,6 +708,9 @@ class TradeLifecycleManager:
         self.tp1_atr_mult = tp1_atr_mult
         self.tp1_min_atr_mult = tp1_min_atr_mult
         self.tp2_atr_mult = tp2_atr_mult
+        self.tp3_atr_mult = tp3_atr_mult
+        self.tp4_atr_mult = tp4_atr_mult
+        self.tp5_atr_mult = tp5_atr_mult
         self.runner_trail_atr_mult = runner_trail_atr_mult
         self.breakeven_buffer_atr_mult = breakeven_buffer_atr_mult
         self.scratch_win_trigger_atr_mult = scratch_win_trigger_atr_mult
@@ -694,9 +723,12 @@ class TradeLifecycleManager:
         funding_rate: float | None = None,
         htf_df: pd.DataFrame | None = None,
     ) -> tuple[PositionState | None, dict]:
-        """Build a ladder (via EntryLadderEngine), then price the Step
-        11.0 geometry directly off its theoretical VWAP: 2 static targets
-        (TP1/TP2) plus a trailing runner for whatever weight is left.
+        """Build a ladder (via EntryLadderEngine), then price 5 static
+        targets (TP1-TP5) directly off its theoretical VWAP. The resulting
+        `PositionState` still carries a `runner_weight` field (default
+        0.0, since `TP_WEIGHTS` sums to 1.0) for a caller who wants to
+        override `tp_weights` after construction toward the legacy
+        2-target-plus-runner geometry instead.
 
         Returns:
             (position, diagnostics). `position` is None if the entry
@@ -739,16 +771,20 @@ class TradeLifecycleManager:
         tp1_dist = max(self.tp1_atr_mult, self.tp1_min_atr_mult) * last_atr
         tp1 = tp_anchor_vwap + sign * tp1_dist
         tp2 = tp_anchor_vwap + sign * self.tp2_atr_mult * last_atr
+        tp3 = tp_anchor_vwap + sign * self.tp3_atr_mult * last_atr
+        tp4 = tp_anchor_vwap + sign * self.tp4_atr_mult * last_atr
+        tp5 = tp_anchor_vwap + sign * self.tp5_atr_mult * last_atr
         risk_atr_multiple = abs(expected_vwap - initial_sl) / last_atr
         diagnostics.update(initial_sl=initial_sl, expected_vwap=expected_vwap, risk_atr_multiple=risk_atr_multiple)
 
         position = PositionState(
             direction=direction, ladder=ladder,
             initial_sl=initial_sl, current_sl=initial_sl,
-            tp_levels=[tp1, tp2, None, None, None],
+            tp_levels=[tp1, tp2, tp3, tp4, tp5],
             breakeven_buffer_atr_mult=self.breakeven_buffer_atr_mult,
             scratch_win_trigger_atr_mult=self.scratch_win_trigger_atr_mult,
             tp1_atr_mult=self.tp1_atr_mult, tp1_min_atr_mult=self.tp1_min_atr_mult, tp2_atr_mult=self.tp2_atr_mult,
+            tp3_atr_mult=self.tp3_atr_mult, tp4_atr_mult=self.tp4_atr_mult, tp5_atr_mult=self.tp5_atr_mult,
             runner_trail_atr_mult=self.runner_trail_atr_mult,
             time_decay_bars=self.time_decay_bars,
         )

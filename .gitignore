@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 cooldown.json
 cooldown_gem.json
+cooldown_kryptic.json
 risk_state.json
 *_risk_state.json
 backtest_report*.xlsx

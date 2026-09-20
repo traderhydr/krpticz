@@ -36,14 +36,16 @@ from regime_filter import RegimeFilter
 
 Direction = Literal["LONG", "SHORT"]
 
-LADDER_WEIGHTS: tuple[float, float, float, float] = (0.40, 0.35, 0.25, 0.0)
-"""High-frequency trend-breakout calibration (15m execution, shallow entry
-fills): 3 active tiers -- Entry 1 dominant (breakout/FVG-proximal, 0.40),
-Entry 2 a shallow 0.382-0.50 retracement (0.35), Entry 3 a deeper 0.618-
-0.705 retracement (0.25). Entry 4 (the origin-sweep/ATR-band tier) is kept
-in the ladder structurally (so every EntryLadder still has exactly 4
-levels) but carries 0 weight -- effectively disabled, since this profile
-doesn't wait for a full liquidity sweep back to the impulse origin."""
+LADDER_WEIGHTS: tuple[float, float, float, float] = (0.40, 0.30, 0.20, 0.10)
+"""All 4 tiers active, front-loaded toward the shallower fills (matching
+ZENITH's/GEM's own ENTRY_WEIGHTS front-loading, for a consistent ladder
+shape across all three engines): Entry 1 dominant (breakout/FVG-proximal,
+0.40), Entry 2 a shallow 0.382-0.50 retracement (0.30), Entry 3 a deeper
+0.618-0.705 retracement (0.20), Entry 4 the origin-sweep/ATR-band tier
+(0.10) -- previously 0-weighted ("effectively disabled") since this
+profile doesn't wait for a full liquidity sweep back to the impulse
+origin; kept active now so a real liquidity sweep back to origin still
+adds size instead of being ignored."""
 ENTRY3_TIER_INDEX = 2  # the bar-delta-gated tier, fixed by the 4-tier spec
 
 

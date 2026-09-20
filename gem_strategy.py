@@ -16,6 +16,16 @@ Candle shape is kept as the original {t,o,h,l,c,v} (oldest first) rather
 than translated to English field names, so this file stays a direct,
 checkable translation of motor-gem.js. Use `from_repo_candles()` to adapt
 this repo's shared {ts,open,high,low,close,volume} kline shape into it.
+
+Deviation from the port (KRPTICZ 4-entry/5-TP standardization): the
+original `evaluar()`'s default entry path built 3 entries (E1/E2/E3) and
+`CFG.TP`/`CFG.CLOSES` had 3 take-profit tiers. A 4th entry (E4, gated by
+`E4_FRACTION`/`ENTRY_WEIGHTS`) and 2 more take-profits (TP4/TP5, via `TP`/
+`CLOSES` now holding 5 values each) were added so GEM posts the same
+4-entry/5-TP signal shape as ZENITH and KRYPTIC, at the cost of no longer
+being numerically identical to `motor-gem.js` on this path -- every other
+rejection code, gate, and the E1/E2/E3/TP1/TP2/TP3 math it still computes
+remain the original, verified port.
 """
 from __future__ import annotations
 
@@ -39,9 +49,11 @@ GEM_CFG: dict = {
     "E3_FRACTION": 0.75,
     "E2_SEP_MIN_ATR": 0.5,
     "E2_SEP_MAX_ATR": 1.2,
+    "E4_FRACTION": 0.92,     # deepest retracement level for E4 (KRPTICZ 4-entry standardization)
     "EQUAL_ENTRIES": True,
     "WEIGHT_E1": 0.40,
     "WEIGHT_E2": 0.60,
+    "ENTRY_WEIGHTS": [0.40, 0.30, 0.20, 0.10],  # 4-entry ladder weights (E1..E4)
 
     "REACH_MAX_ATR": 1.2,     # E1 never further than this from current price
     "ENTRY_MAX_ATR": 99.0,
@@ -78,10 +90,10 @@ GEM_CFG: dict = {
     "VOL_MIN": 0.5,
     "FUNDING_VETO": 0.10,     # % per 8h
 
-    "TP": [0.80, 1.40, 2.40],   # in multiples of R, off Eavg
+    "TP": [0.80, 1.40, 2.20, 3.20, 4.40],   # in multiples of R, off Eavg
     "TP1_FIXED": False,
     "TP1_FIXED_PCT": 1.00,
-    "CLOSES": [0.70, 0.25, 0.05],   # size closed at TP1/TP2/TP3
+    "CLOSES": [0.35, 0.25, 0.20, 0.12, 0.08],   # size closed at TP1..TP5
 
     "CANCEL_BARS": 6,   # bars unfilled before the ladder is cancelled
     "CLOSE_BARS": 8,    # bars without reaching UMBRAL before a time-exit
@@ -417,14 +429,25 @@ def evaluate(
             ]
     elif GEM_CFG["E3_FRACTION"] > 0:
         sep3 = GEM_CFG["E3_FRACTION"] * dist_sl
-        sep3 = min(max(sep3, sep * 1.5), 0.92 * dist_sl)
+        sep3 = min(max(sep3, sep * 1.5), 0.85 * dist_sl)
         E3 = (E1 - sep3) if direction == "LONG" else (E1 + sep3)
         if direction == "LONG" and E3 <= SL:
             return _reject("E3_SL", "E3 would fall past the stop")
         if direction == "SHORT" and E3 >= SL:
             return _reject("E3_SL", "E3 would fall past the stop")
-        entries = [E1, E2, E3]
-        weights = [1 / 3, 1 / 3, 1 / 3]
+        # E4: a 4th, deepest tier beyond E3 (KRPTICZ 4-entry standardization
+        # -- not present in the original motor-gem.js, which stopped at 3
+        # entries here). Capped below dist_sl so it always stays strictly
+        # between E3 and the stop.
+        sep4 = GEM_CFG["E4_FRACTION"] * dist_sl
+        sep4 = min(max(sep4, sep3 * 1.15), 0.97 * dist_sl)
+        E4 = (E1 - sep4) if direction == "LONG" else (E1 + sep4)
+        if direction == "LONG" and E4 <= SL:
+            return _reject("E4_SL", "E4 would fall past the stop")
+        if direction == "SHORT" and E4 >= SL:
+            return _reject("E4_SL", "E4 would fall past the stop")
+        entries = [E1, E2, E3, E4]
+        weights = list(GEM_CFG["ENTRY_WEIGHTS"])
     else:
         entries = [E1, E2]
         weights = [GEM_CFG["WEIGHT_E1"], GEM_CFG["WEIGHT_E2"]]

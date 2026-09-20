@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pandas as pd
 
 try:
     from dotenv import load_dotenv
@@ -26,9 +27,11 @@ except ImportError:
             os.environ.setdefault(k.strip(), v.strip())
 
 import gem_strategy as gem
+import kryptic_strategy as kryptic
 from exchanges import resolve_source
 from formatter import format_signal
 from risk_guard import RiskGuard
+from risk_manager import TradeLifecycleManager
 from strategy import (
     FIB_CFG,
     apply_strategy_profile,
@@ -149,6 +152,26 @@ def _cfg() -> dict:
         "gem_max_posts_per_scan": int(os.getenv("GEM_MAX_SIGNALS_PER_SCAN", "3")),
         "gem_leverage_min": int(os.getenv("GEM_LEVERAGE_MIN", "10")),
         "gem_leverage_max": int(os.getenv("GEM_LEVERAGE_MAX", "10")),
+        # --- KRYPTIC: third strategy engine (kryptic_strategy.py, over
+        # entry_ladder.py/regime_filter.py/directional_bias.py/
+        # risk_manager.py), same bot/chat/RiskGuard as ZENITH/GEM above.
+        # Unlike ZENITH/GEM, KRYPTIC's own entry gate is pass/fail (no
+        # continuous score) -- see kryptic_strategy.KRYPTIC_CFG["SCORE"].
+        "kryptic_enabled": _env_bool("KRYPTIC_ENABLED", True),
+        "kryptic_timeframe": os.getenv("KRYPTIC_TIMEFRAME", "15m"),
+        "kryptic_top_n": int(os.getenv("KRYPTIC_TOP_N", "30")),
+        "kryptic_min_quote_vol": float(os.getenv("KRYPTIC_MIN_QUOTE_VOLUME_USD", "20000000")),
+        "kryptic_cooldown_min": int(os.getenv("KRYPTIC_COOLDOWN_MINUTES", "240")),
+        "kryptic_max_posts_per_scan": int(os.getenv("KRYPTIC_MAX_SIGNALS_PER_SCAN", "2")),
+        "kryptic_leverage_min": int(os.getenv("KRYPTIC_LEVERAGE_MIN", "10")),
+        "kryptic_leverage_max": int(os.getenv("KRYPTIC_LEVERAGE_MAX", "15")),
+        # TradeLifecycleManager geometry -- see risk_manager.py for defaults.
+        "kryptic_initial_sl_atr_mult": float(os.getenv("KRYPTIC_INITIAL_SL_ATR_MULT", "2.60")),
+        "kryptic_tp1_atr_mult": float(os.getenv("KRYPTIC_TP1_ATR_MULT", "1.10")),
+        "kryptic_tp2_atr_mult": float(os.getenv("KRYPTIC_TP2_ATR_MULT", "2.80")),
+        "kryptic_tp3_atr_mult": float(os.getenv("KRYPTIC_TP3_ATR_MULT", "4.20")),
+        "kryptic_tp4_atr_mult": float(os.getenv("KRYPTIC_TP4_ATR_MULT", "5.60")),
+        "kryptic_tp5_atr_mult": float(os.getenv("KRYPTIC_TP5_ATR_MULT", "7.00")),
     }
 
 
@@ -170,6 +193,25 @@ def configure_gem_strategy() -> None:
             gem.GEM_CFG[key] = float(raw)
         else:
             gem.GEM_CFG[key] = raw
+
+
+def configure_kryptic_strategy() -> None:
+    """Same generic env-override pattern as configure_gem_strategy(), over
+    kryptic_strategy.KRYPTIC_CFG's much smaller surface (its own quality
+    score plus BE/cancel/close bar knobs -- entry/TP geometry itself lives
+    on TradeLifecycleManager, configured in main() from cfg["kryptic_*"])."""
+    for key, current in list(kryptic.KRYPTIC_CFG.items()):
+        raw = os.getenv(f"KRYPTIC_{key}", "").strip()
+        if not raw:
+            continue
+        if isinstance(current, bool):
+            kryptic.KRYPTIC_CFG[key] = _env_bool(f"KRYPTIC_{key}", current)
+        elif isinstance(current, int):
+            kryptic.KRYPTIC_CFG[key] = int(float(raw))
+        elif isinstance(current, float):
+            kryptic.KRYPTIC_CFG[key] = float(raw)
+        else:
+            kryptic.KRYPTIC_CFG[key] = raw
 
 
 class Cooldown:
@@ -527,6 +569,137 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
         log.info("posted GEM %s %s score=%s lev=%sx", symbol, sig.side, sig.score, lev)
 
 
+async def evaluate_one_kryptic(
+    client: httpx.AsyncClient, symbol: str, cfg: dict, btc_df: pd.DataFrame, trade_manager: TradeLifecycleManager,
+) -> dict | None:
+    try:
+        fund = await fetch_funding(client, symbol)
+    except Exception:
+        fund = None
+    candles, _src = await fetch_klines(client, symbol, cfg["kryptic_timeframe"], limit=240)
+    candles = closed_candles(candles)
+    if len(candles) < 80:
+        if cfg["log_rejects"]:
+            log.info("kryptic reject %s: insufficient candles", symbol)
+        return None
+    df = kryptic.candles_to_df(candles)
+    position, diagnostics = kryptic.evaluate(df, btc_df, fund, trade_manager=trade_manager)
+    if position is None:
+        if cfg["log_rejects"]:
+            log.info("kryptic reject %s: %s", symbol, diagnostics.get("reason"))
+        return None
+    return {
+        "position": position, "diagnostics": diagnostics,
+        "reference": float(df["close"].iloc[-1]), "last_ts": candles[-1].get("ts"),
+    }
+
+
+async def kryptic_scan_once(
+    client: httpx.AsyncClient, cfg: dict, cool: Cooldown, universe: dict, risk: RiskGuard, trade_manager: TradeLifecycleManager,
+) -> None:
+    """Same shape as gem_scan_once() but for the KRYPTIC engine: its own
+    cooldown namespace and leverage band, same shared RiskGuard. Fetches
+    BTCUSDT candles once per scan (RegimeFilter's macro beta gate) rather
+    than per-symbol."""
+    tickers = universe.get("tickers") or []
+    if cfg["symbols"]:
+        want = set(cfg["symbols"])
+        tickers = [t for t in tickers if t["symbol"] in want]
+    deny = cfg.get("denylist") or set()
+    if deny:
+        tickers = [t for t in tickers if t["symbol"] not in deny]
+    batch = [t for t in tickers if t.get("quote_vol", 0) >= cfg["kryptic_min_quote_vol"]]
+    batch.sort(key=lambda t: t.get("quote_vol", 0), reverse=True)
+    batch = batch[: cfg["kryptic_top_n"]]
+
+    try:
+        btc_raw, _ = await fetch_klines(client, "BTCUSDT", "1h", limit=240)
+        btc_df = kryptic.candles_to_df(closed_candles(btc_raw))
+    except Exception as e:
+        log.warning("kryptic BTC fetch failed: %s", e)
+        return
+
+    sem = asyncio.Semaphore(cfg["concurrency"])
+    candidates: list[tuple[dict, object, int, str]] = []
+
+    async def score_one(t: dict):
+        symbol = t["symbol"]
+        if not cool.ready(f"kryptic:{symbol}"):
+            return
+        async with sem:
+            try:
+                result = await evaluate_one_kryptic(client, symbol, cfg, btc_df, trade_manager)
+            except Exception as e:
+                log.warning("kryptic scan %s failed: %s", symbol, e)
+                return
+        if not result:
+            return
+        position = result["position"]
+        lev = leverage_from_quality(
+            kryptic.KRYPTIC_CFG["SCORE"],
+            side=position.direction,
+            lev_min=cfg["kryptic_leverage_min"],
+            lev_max=cfg["kryptic_leverage_max"],
+            ratr=result["diagnostics"].get("risk_atr_multiple"),
+        )
+        exch_max = int((universe.get("max_lev") or {}).get(symbol) or cfg["kryptic_leverage_max"])
+        if exch_max < cfg["kryptic_leverage_min"]:
+            if cfg["log_rejects"]:
+                log.info("kryptic reject %s: exch max lev %s < min %s", symbol, exch_max, cfg["kryptic_leverage_min"])
+            return
+        lev = max(1, min(lev, exch_max, cfg["kryptic_leverage_max"]))
+        sig = kryptic.build_signal(
+            symbol, position, result["diagnostics"],
+            leverage=lev, timeframe=cfg["kryptic_timeframe"], reference=result["reference"],
+        )
+        candidates.append((result, sig, lev, symbol))
+
+    await asyncio.gather(*(score_one(t) for t in batch))
+    if not candidates:
+        log.info("kryptic scan: no candidates")
+        return
+
+    # KRYPTIC_CFG["SCORE"] is constant across every candidate (see its own
+    # docstring), so rank by tightest risk (lowest risk_atr_multiple) instead.
+    candidates.sort(key=lambda x: float(x[0]["diagnostics"].get("risk_atr_multiple") or 999.0))
+    picks = candidates[: cfg["kryptic_max_posts_per_scan"]]
+    for result, sig, lev, symbol in picks:
+        if not risk.can_open(sig.side, cfg):
+            log.info(
+                "risk_guard: skip KRYPTIC %s %s (paused=%s open=%s dd=%.2f%%)",
+                symbol, sig.side, risk.paused, risk.concurrent_count(), risk.drawdown_pct(),
+            )
+            continue
+        text = format_signal(sig)
+        if cfg["dry_run"]:
+            log.info("DRY_RUN would post KRYPTIC %s %s score=%s lev=%sx\n%s", symbol, sig.side, sig.score, lev, text)
+        else:
+            try:
+                await post_telegram(client, cfg, text)
+            except Exception as e:
+                log.error("telegram %s: %s", symbol, e)
+                continue
+        await cool.hit(f"kryptic:{symbol}")
+        risk.open_trade(
+            symbol=symbol,
+            side=sig.side,
+            timeframe=cfg["kryptic_timeframe"],
+            entries=list(sig.entries),
+            entry_weights=list(sig.entry_weights),
+            sl=float(sig.sl),
+            risk_px=float(sig.extras.get("r_unit") or abs(sig.entries[0] - sig.sl)),
+            be_buffer_r=0.0,
+            tps=list(sig.tps),
+            tp_weights=list(sig.tp_weights),
+            be_after_tp1=bool(sig.extras.get("be_after_tp1", True)),
+            cancel_velas=int(sig.extras.get("cancel_velas") or cfg["cancel_velas"]),
+            close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
+            risk_equity_pct=cfg["risk_equity_pct"],
+            last_ts=result.get("last_ts"),
+        )
+        log.info("posted KRYPTIC %s %s score=%s lev=%sx", symbol, sig.side, sig.score, lev)
+
+
 def configure_strategy(cfg: dict) -> str:
     """Apply cfg + env overrides onto FIB_CFG. Shared by bot.py and
     backtest.py so a backtest run reflects the exact same strategy
@@ -592,9 +765,19 @@ async def main() -> None:
     cfg = _cfg()
     profile = configure_strategy(cfg)
     configure_gem_strategy()
+    configure_kryptic_strategy()
     cool = Cooldown(cfg["cooldown_min"])
     cool_gem = Cooldown(cfg["gem_cooldown_min"], path=Path(__file__).with_name("cooldown_gem.json"))
+    cool_kryptic = Cooldown(cfg["kryptic_cooldown_min"], path=Path(__file__).with_name("cooldown_kryptic.json"))
     risk = RiskGuard()
+    kryptic_trade_manager = TradeLifecycleManager(
+        initial_sl_atr_mult=cfg["kryptic_initial_sl_atr_mult"],
+        tp1_atr_mult=cfg["kryptic_tp1_atr_mult"],
+        tp2_atr_mult=cfg["kryptic_tp2_atr_mult"],
+        tp3_atr_mult=cfg["kryptic_tp3_atr_mult"],
+        tp4_atr_mult=cfg["kryptic_tp4_atr_mult"],
+        tp5_atr_mult=cfg["kryptic_tp5_atr_mult"],
+    )
     async with httpx.AsyncClient(headers={"User-Agent": "zenith-bot/1.0"}) as client:
         log.info(
             "data source=%s (both strategies + RiskGuard price/candle data)",
@@ -628,6 +811,13 @@ async def main() -> None:
                 cfg["gem_leverage_min"], cfg["gem_leverage_max"], cfg["gem_cooldown_min"],
                 cfg["gem_max_posts_per_scan"],
             )
+        if cfg["kryptic_enabled"]:
+            log.info(
+                "KRYPTIC enabled — tf=%s top_n=%s min_vol=%s lev %s-%sx cooldown=%smin max_posts=%s",
+                cfg["kryptic_timeframe"], cfg["kryptic_top_n"], cfg["kryptic_min_quote_vol"],
+                cfg["kryptic_leverage_min"], cfg["kryptic_leverage_max"], cfg["kryptic_cooldown_min"],
+                cfg["kryptic_max_posts_per_scan"],
+            )
         while True:
             try:
                 await risk.refresh(client)
@@ -657,6 +847,10 @@ async def main() -> None:
                     gem_universe = await load_universe(client, cfg["gem_min_quote_vol"])
                     log.info("gem universe %s names", len(gem_universe.get("tickers") or []))
                     await gem_scan_once(client, cfg, cool_gem, gem_universe, risk)
+                if cfg["kryptic_enabled"]:
+                    kryptic_universe = await load_universe(client, cfg["kryptic_min_quote_vol"])
+                    log.info("kryptic universe %s names", len(kryptic_universe.get("tickers") or []))
+                    await kryptic_scan_once(client, cfg, cool_kryptic, kryptic_universe, risk, kryptic_trade_manager)
             except Exception as e:
                 log.exception("scan loop: %s", e)
             await asyncio.sleep(cfg["scan_seconds"])

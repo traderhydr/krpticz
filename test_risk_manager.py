@@ -73,12 +73,14 @@ class TradeLifecycleManagerGeometryTests(unittest.TestCase):
         # floor (0.30), so tp1_atr_mult itself governs.
         self.assertAlmostEqual(pos.tp_levels[0], expected_vwap + 1.10 * self.atr, places=6)
         self.assertAlmostEqual(pos.tp_levels[1], expected_vwap + 2.80 * self.atr, places=6)
-        self.assertIsNone(pos.tp_levels[2])
-        self.assertIsNone(pos.tp_levels[3])
-        self.assertIsNone(pos.tp_levels[4])
+        # All 5 tiers are now real, fixed price targets (see TP_WEIGHTS'
+        # own docstring) -- TP3/4/5 continue the same off-vwap ATR spacing.
+        self.assertAlmostEqual(pos.tp_levels[2], expected_vwap + 4.20 * self.atr, places=6)
+        self.assertAlmostEqual(pos.tp_levels[3], expected_vwap + 5.60 * self.atr, places=6)
+        self.assertAlmostEqual(pos.tp_levels[4], expected_vwap + 7.00 * self.atr, places=6)
         self.assertAlmostEqual(diag["risk_atr_multiple"], 2.60, places=6)
-        self.assertEqual(list(pos.tp_weights), [0.20, 0.50, 0.0, 0.0, 0.0])
-        self.assertAlmostEqual(pos.runner_weight, 0.30, places=6)
+        self.assertEqual(list(pos.tp_weights), [0.20, 0.30, 0.20, 0.15, 0.15])
+        self.assertAlmostEqual(pos.runner_weight, 0.0, places=6)
 
     def test_short_geometry_is_symmetric(self) -> None:
         ladder = EntryLadder(direction="SHORT", levels=[100.0, 105.0, 110.0, 115.0])
@@ -277,9 +279,14 @@ class TpLadderProtectionTests(unittest.TestCase):
     already justified taking profit."""
 
     def test_tp1_hit_cancels_remaining_unfilled_entry_tiers(self) -> None:
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0])
+        # Explicit legacy weights (ladder [0.40, 0.35, 0.25, 0.0], TP
+        # [0.20, 0.50, 0.0, 0.0, 0.0] + 0.30 runner) -- this test's own
+        # arithmetic in the comments below is tied to that exact geometry,
+        # independent of whatever the current *default* weights are.
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0])
         pos = PositionState(direction="LONG", ladder=ladder, initial_sl=70.0, current_sl=70.0,
-                             tp_levels=[105.0, 110.0, None, None, None])
+                             tp_levels=[105.0, 110.0, None, None, None],
+                             tp_weights=[0.20, 0.50, 0.0, 0.0, 0.0], runner_weight=0.30)
         # Entry 1 (100, 0.40) and Entry 2 (95, 0.35) both fill on a
         # gap-through bar (0.75 total, real vwap = 97.667) -- re-anchoring
         # (see TpReanchoringTests) immediately repriced TP1/TP2 to
@@ -295,9 +302,10 @@ class TpLadderProtectionTests(unittest.TestCase):
         self.assertFalse(pos.closed)
 
     def test_later_retracement_cannot_fill_a_tier_cancelled_by_tp1(self) -> None:
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0])
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0])
         pos = PositionState(direction="LONG", ladder=ladder, initial_sl=70.0, current_sl=70.0,
-                             tp_levels=[105.0, 110.0, None, None, None])
+                             tp_levels=[105.0, 110.0, None, None, None],
+                             tp_weights=[0.20, 0.50, 0.0, 0.0, 0.0], runner_weight=0.30)
         pos.update({"high": 100.0, "low": 94.0, "close": 99.5, "volume": 500, "atr": 2.0})
         self.assertEqual(pos.ladder.fills, [True, True, False, False])
         self.assertFalse(pos.closed)
@@ -314,9 +322,10 @@ class TpLadderProtectionTests(unittest.TestCase):
         whatever's actually open, and with every other tier cancelled at
         the same time, the position is fully closed in this one bar with
         nothing left for the runner tier to trail."""
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0])
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0])
         pos = PositionState(direction="LONG", ladder=ladder, initial_sl=70.0, current_sl=70.0,
-                             tp_levels=[110.0, 120.0, None, None, None])
+                             tp_levels=[110.0, 120.0, None, None, None],
+                             tp_weights=[0.20, 0.50, 0.0, 0.0, 0.0], runner_weight=0.30)
         pos.update({"high": 111.0, "low": 99.0, "close": 110.5, "volume": 500, "atr": 2.0})
         self.assertTrue(pos.closed)
         self.assertEqual(pos.open_size, 0.0)
@@ -330,9 +339,10 @@ class TpLadderProtectionTests(unittest.TestCase):
         breakeven-buffer-turned-trail stop, so the position DOES end up
         closed by the end of this same bar -- but via a real RUNNER_EXIT,
         not because TP1+TP2 alone summed to the full position."""
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0])
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0])
         pos = PositionState(direction="LONG", ladder=ladder, initial_sl=70.0, current_sl=70.0,
-                             tp_levels=[105.0, 110.0, None, None, None])
+                             tp_levels=[105.0, 110.0, None, None, None],
+                             tp_weights=[0.20, 0.50, 0.0, 0.0, 0.0], runner_weight=0.30)
         # Entry 1+2 fill (vwap=97.667); high=105 clears both re-anchored
         # targets (99.867 and 103.267), so TP1 closes 0.20 of the 0.75
         # filled and TP2 closes another 0.50 (a REAL TP_HIT, not
@@ -573,7 +583,10 @@ class ZeroWeightPhantomPositionTests(unittest.TestCase):
     """
 
     def test_long_gap_through_bar_fills_shallow_tiers_alongside_the_deep_one(self) -> None:
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0])  # default weights: entry4 = 0.0
+        # Explicit legacy weights: entry4 = 0.0, pinning this specific
+        # zero-weight-tier scenario independent of the *current* default
+        # (now [0.40, 0.30, 0.20, 0.10], all 4 tiers active).
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0])
         # [83, 87] never straddles entry1/2/3 (100/95/90) the way the OLD
         # check required -- this is exactly the gap that used to strand
         # Entry 4 alone. bar_delta here is negative (close near the low),
@@ -604,7 +617,8 @@ class ZeroWeightPhantomPositionTests(unittest.TestCase):
         (bypassing update_fills, which can no longer reach it) to prove
         the guard itself is still correct on its own, independent of the
         fix above."""
-        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], fills=[False, False, False, True])
+        ladder = EntryLadder(direction="LONG", levels=[100.0, 95.0, 90.0, 85.0], weights=[0.40, 0.35, 0.25, 0.0],
+                              fills=[False, False, False, True])
         self.assertFalse(ladder.has_active_fills)
         self.assertIsNone(ladder.calculate_vwap(), "a fill with zero total weight must report 'nothing meaningfully filled', not divide by zero")
 
@@ -619,7 +633,7 @@ class ZeroWeightPhantomPositionTests(unittest.TestCase):
         filled_tiers = {e["tier_index"] for e in log if e["type"] == "ENTRY_FILL"}
         self.assertEqual(filled_tiers, {0, 1, 3})
         self.assertIsNotNone(pos.weighted_avg_entry)
-        self.assertAlmostEqual(pos.open_size, 0.75, places=6)  # 0.40 + 0.35 + 0.0 (entry4)
+        self.assertAlmostEqual(pos.open_size, 0.80, places=6)  # 0.40 + 0.30 + 0.10 (entry4, now active)
 
 
 class TpHitBeforeAnyEntryFillTests(unittest.TestCase):
