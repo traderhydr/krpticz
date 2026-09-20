@@ -140,11 +140,18 @@ keeps an approximate compounding equity curve from `RISK_EQUITY_PCT`, and:
   (default 1.5) — hysteresis to avoid flapping at the ceiling;
 - caps simultaneously open (simulated) trades via `MAX_CONCURRENT_TRADES`
   (default 4) and same-direction exposure via `MAX_CONCURRENT_SAME_SIDE`
-  (default 3), so correlated alts can't stack drawdown risk unnoticed.
+  (default 3), so correlated alts can't stack drawdown risk unnoticed;
+- blocks a second signal on the same **(symbol, direction)** while one from
+  ANY engine (ZENITH/GEM/KRYPTIC) is already open (`RiskGuard.has_open_position()`)
+  — on a real hedge-mode Binance account, two of our own signals on the
+  same symbol+side would merge into one indistinguishable position anyway,
+  so this also keeps every open trade individually attributable for the
+  reconciliation feature below.
 
 This is a simulation for self-throttling, not a substitute for reconciling
 against real fills — it assumes full fills at the published average entry.
-State persists to `risk_state.json` (gitignored) next to the bot.
+State persists to `risk_state.json` (gitignored) next to the bot. See
+"Reconciling against real fills" below for closing that gap.
 
 ## Backtest -> Excel report
 
@@ -334,6 +341,56 @@ opens or tracks a persistent position the way `KrypticEngine` does.
   `leverage_from_quality`'s score-to-leverage mapping and `bot.py`'s
   cross-candidate ranking within one scan — it never gates whether a setup
   is taken.
+
+## Reconciling against real fills (shadow mode)
+
+`RiskGuard`'s equity/drawdown is a *simulation* — it never talks to Cornix
+or your exchange account (see its own section above). `exchange_reconciler.py`
+closes part of that gap: a **shadow-mode-only** module that reads real
+Binance USD-M futures fills with a read-only API key and logs how far
+RiskGuard's simulated fills/R diverge from what actually happened — without
+ever changing `risk.equity`/`risk.paused`/`can_open()`. Nothing it does can
+affect whether the bot posts a signal.
+
+**Setup:**
+1. Create a Binance API key with **only "Enable Reading" checked** — never
+   reuse the trade-enabled key you gave Cornix. The bot calls
+   `/sapi/v1/account/apiRestrictions` at startup and refuses to run if this
+   key has withdrawals or spot/margin trading enabled.
+2. Set `RECONCILE_ENABLED=1`, `BINANCE_RECONCILE_API_KEY`, and
+   `BINANCE_RECONCILE_API_SECRET` in `.env`.
+3. Requires **Binance hedge mode** (separate LONG/SHORT position buckets
+   per symbol) — one-way mode isn't supported yet (`ExchangeReconciler`
+   raises `NotImplementedError` if `RECONCILE_POSITION_MODE` isn't `hedge`).
+
+**The hard problem is attribution, not the HTTP calls:** Binance has no
+concept of "which signal" a fill belongs to, and if two of our own signals
+were ever open on the same (symbol, direction) at once, their real fills
+would be genuinely indistinguishable on the exchange. `RiskGuard.can_open()`
+now blocks that case outright (see above), so in practice every open trade
+has exactly one candidate to attribute real fills to; if it ever finds more
+than one anyway (e.g. state left over from before this guard existed), it
+logs `AMBIGUOUS` and refuses to guess rather than attributing a fill to the
+wrong trade.
+
+Real R is computed the same scale-invariant way the simulation itself
+does — `(exit_price - eavg) / risk_px`, from real fill **prices** only —
+rather than from Binance's dollar realized-PnL, which this bot has no way
+to convert into a comparable R-multiple without knowing the real position's
+contract size (that lives entirely in Cornix's/your own risk sizing, not
+anything this bot transmits).
+
+Discrepancies are appended as JSON lines to `reconcile_log.jsonl`
+(gitignored) — one row per open trade per cycle, with `status` (`AMBIGUOUS`
+/ `NO_REAL_FILLS_YET` / `OPEN` / `CLOSED` / `FETCH_FAILED`), the simulated
+vs. real `eavg`/R, and a `discrepancy` block once there's something real to
+compare against.
+
+**Known limitation:** written from Binance's public API docs, not tested
+against a live account — this dev sandbox's network policy blocks outbound
+access to Binance, the same limitation `backtest.py`'s own docstring
+already documents for its data fetch. Run a manual smoke test against your
+own account (in shadow mode — it's inert by design) before trusting the log.
 
 ## Run (Google Cloud VM)
 

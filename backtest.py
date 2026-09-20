@@ -636,7 +636,7 @@ async def run(args: argparse.Namespace) -> None:
                 picks = picks[: cfg["max_posts_per_scan"]]
 
                 for scored, sig, lev, sym in picks:
-                    if not risk.can_open(sig.side, cfg):
+                    if not risk.can_open(symbol, sig.side, cfg):
                         continue
                     key = risk.open_trade(
                         symbol=sym,
@@ -654,6 +654,7 @@ async def run(args: argparse.Namespace) -> None:
                         close_velas=cfg["close_velas"],
                         risk_equity_pct=cfg["risk_equity_pct"],
                         last_ts=master_ts,
+                        engine="ZENITH",
                     )
                     if key is None:
                         continue
@@ -726,7 +727,7 @@ async def run(args: argparse.Namespace) -> None:
                 gem_picks = gem_candidates[: cfg["gem_max_posts_per_scan"]]
 
                 for result, sig, lev, sym in gem_picks:
-                    if not risk.can_open(sig.side, cfg):
+                    if not risk.can_open(symbol, sig.side, cfg):
                         continue
                     key = risk.open_trade(
                         symbol=sym,
@@ -744,6 +745,7 @@ async def run(args: argparse.Namespace) -> None:
                         close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
                         risk_equity_pct=cfg["risk_equity_pct"],
                         last_ts=master_ts,
+                        engine="GEM",
                     )
                     if key is None:
                         continue
@@ -816,7 +818,7 @@ async def run(args: argparse.Namespace) -> None:
                 kryptic_picks = kryptic_candidates[: cfg["kryptic_max_posts_per_scan"]]
 
                 for diagnostics, sig, lev, sym in kryptic_picks:
-                    if not risk.can_open(sig.side, cfg):
+                    if not risk.can_open(symbol, sig.side, cfg):
                         continue
                     key = risk.open_trade(
                         symbol=sym,
@@ -834,6 +836,7 @@ async def run(args: argparse.Namespace) -> None:
                         close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
                         risk_equity_pct=cfg["risk_equity_pct"],
                         last_ts=master_ts,
+                        engine="KRYPTIC",
                     )
                     if key is None:
                         continue

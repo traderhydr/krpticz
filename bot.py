@@ -26,6 +26,7 @@ except ImportError:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
+import exchange_reconciler
 import gem_strategy as gem
 import kryptic_strategy as kryptic
 from exchanges import resolve_source
@@ -172,6 +173,16 @@ def _cfg() -> dict:
         "kryptic_tp3_atr_mult": float(os.getenv("KRYPTIC_TP3_ATR_MULT", "4.20")),
         "kryptic_tp4_atr_mult": float(os.getenv("KRYPTIC_TP4_ATR_MULT", "5.60")),
         "kryptic_tp5_atr_mult": float(os.getenv("KRYPTIC_TP5_ATR_MULT", "7.00")),
+        # --- Shadow-mode reconciliation against REAL Binance fills (see
+        # exchange_reconciler.py). Off by default; even when on, it only
+        # LOGS discrepancies (reconcile_log.jsonl) -- it never changes
+        # risk.equity/paused/can_open, so it can never affect whether the
+        # bot posts a signal. Requires a Binance API key with ONLY "Enable
+        # Reading" checked -- never the trade-enabled key given to Cornix.
+        "reconcile_enabled": _env_bool("RECONCILE_ENABLED", False),
+        "reconcile_api_key": os.getenv("BINANCE_RECONCILE_API_KEY", "").strip(),
+        "reconcile_api_secret": os.getenv("BINANCE_RECONCILE_API_SECRET", "").strip(),
+        "reconcile_position_mode": os.getenv("RECONCILE_POSITION_MODE", "hedge").strip().lower(),
     }
 
 
@@ -422,7 +433,7 @@ async def scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, univer
 
     picks = picks[: cfg["max_posts_per_scan"]]
     for scored, sig, lev, symbol in picks:
-        if not risk.can_open(sig.side, cfg):
+        if not risk.can_open(symbol, sig.side, cfg):
             log.info(
                 "risk_guard: skip %s %s (paused=%s open=%s dd=%.2f%%)",
                 symbol, sig.side, risk.paused, risk.concurrent_count(), risk.drawdown_pct(),
@@ -454,6 +465,7 @@ async def scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, univer
             close_velas=cfg["close_velas"],
             risk_equity_pct=cfg["risk_equity_pct"],
             last_ts=scored.get("last_ts"),
+            engine=sig.extras.get("engine") or "ZENITH",
         )
         log.info("posted %s %s score=%s lev=%sx", symbol, sig.side, sig.score, lev)
 
@@ -536,7 +548,7 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
     candidates.sort(key=lambda x: float(x[0]["nota"]), reverse=True)
     picks = candidates[: cfg["gem_max_posts_per_scan"]]
     for result, sig, lev, symbol in picks:
-        if not risk.can_open(sig.side, cfg):
+        if not risk.can_open(symbol, sig.side, cfg):
             log.info(
                 "risk_guard: skip GEM %s %s (paused=%s open=%s dd=%.2f%%)",
                 symbol, sig.side, risk.paused, risk.concurrent_count(), risk.drawdown_pct(),
@@ -568,6 +580,7 @@ async def gem_scan_once(client: httpx.AsyncClient, cfg: dict, cool: Cooldown, un
             close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
             risk_equity_pct=cfg["risk_equity_pct"],
             last_ts=result.get("last_ts"),
+            engine=sig.extras.get("engine") or "GEM",
         )
         log.info("posted GEM %s %s score=%s lev=%sx", symbol, sig.side, sig.score, lev)
 
@@ -669,7 +682,7 @@ async def kryptic_scan_once(
     candidates.sort(key=lambda x: float(x[0]["diagnostics"].get("risk_atr_multiple") or 999.0))
     picks = candidates[: cfg["kryptic_max_posts_per_scan"]]
     for result, sig, lev, symbol in picks:
-        if not risk.can_open(sig.side, cfg):
+        if not risk.can_open(symbol, sig.side, cfg):
             log.info(
                 "risk_guard: skip KRYPTIC %s %s (paused=%s open=%s dd=%.2f%%)",
                 symbol, sig.side, risk.paused, risk.concurrent_count(), risk.drawdown_pct(),
@@ -701,6 +714,7 @@ async def kryptic_scan_once(
             close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
             risk_equity_pct=cfg["risk_equity_pct"],
             last_ts=result.get("last_ts"),
+            engine=sig.extras.get("engine") or "KRYPTIC",
         )
         log.info("posted KRYPTIC %s %s score=%s lev=%sx", symbol, sig.side, sig.score, lev)
 
@@ -783,11 +797,25 @@ async def main() -> None:
         tp4_atr_mult=cfg["kryptic_tp4_atr_mult"],
         tp5_atr_mult=cfg["kryptic_tp5_atr_mult"],
     )
+    reconciler = None
     async with httpx.AsyncClient(headers={"User-Agent": "zenith-bot/1.0"}) as client:
         log.info(
             "data source=%s (both strategies + RiskGuard price/candle data)",
             os.getenv("DATA_SOURCE", "blofin").strip().lower() or "blofin",
         )
+        if cfg["reconcile_enabled"]:
+            if not cfg["reconcile_api_key"] or not cfg["reconcile_api_secret"]:
+                raise SystemExit("RECONCILE_ENABLED=1 requires BINANCE_RECONCILE_API_KEY and BINANCE_RECONCILE_API_SECRET")
+            signer = exchange_reconciler.BinanceSignedClient(cfg["reconcile_api_key"], cfg["reconcile_api_secret"])
+            try:
+                await signer.verify_read_only(client)
+            except exchange_reconciler.PermissionError_ as e:
+                raise SystemExit(f"RECONCILE_ENABLED=1 but the API key failed the read-only check: {e}")
+            reconciler = exchange_reconciler.ExchangeReconciler(signer, position_mode=cfg["reconcile_position_mode"])
+            log.info(
+                "reconciliation ENABLED (shadow mode -- logs discrepancies to %s, never affects signal posting)",
+                reconciler.log_path,
+            )
         log.info(
             "ZENITH started — profile=%s scan every %ss, tf=%s, lev %s-%sx, min_score=%s STOP_APRIETA=%s CLOSE=%s dry_run=%s, allow_shorts=%s long_only=%s side_balance=%s max_posts=%s deny=%s risk_pct=%s dd_ceiling=%s%% max_concurrent=%s/%s",
             profile,
@@ -826,6 +854,11 @@ async def main() -> None:
         while True:
             try:
                 await risk.refresh(client)
+                if reconciler is not None:
+                    try:
+                        await reconciler.run_cycle(client, risk)
+                    except Exception as e:
+                        log.warning("reconcile cycle failed (shadow mode -- signal posting unaffected): %s", e)
                 risk.update_pause_state(
                     cfg["dd_ceiling_pct"],
                     cfg["dd_resume_pct"],

@@ -151,12 +151,28 @@ class RiskGuard:
         self._save()
         return self.paused
 
-    def can_open(self, side: str, cfg: dict) -> bool:
+    def has_open_position(self, symbol: str, side: str) -> bool:
+        """Whether ANY engine already has an open (simulated) trade on this
+        exact (symbol, side) -- ZENITH/GEM/KRYPTIC only cooldown themselves
+        independently (see bot.py), so nothing else stops two of them from
+        posting overlapping signals on the same coin+direction. On a real
+        Binance account those would merge into one indistinguishable
+        position (hedge mode: same symbol+positionSide bucket; one-way
+        mode: the same net position entirely), making it impossible to
+        attribute a real fill back to a specific signal -- see
+        exchange_reconciler.py's own docstring. Blocking the second
+        same-(symbol, side) signal up front keeps that attribution always
+        unambiguous instead of trying to disambiguate it after the fact."""
+        return any(t.get("symbol") == symbol and t.get("side") == side for t in self.trades.values())
+
+    def can_open(self, symbol: str, side: str, cfg: dict) -> bool:
         if self.paused:
             return False
         if self.concurrent_count() >= int(cfg["max_concurrent_trades"]):
             return False
         if self.concurrent_count(side) >= int(cfg["max_concurrent_same_side"]):
+            return False
+        if self.has_open_position(symbol, side):
             return False
         return True
 
@@ -178,6 +194,7 @@ class RiskGuard:
         close_velas: int,
         risk_equity_pct: float,
         last_ts: float | int | None,
+        engine: str = "ZENITH",
     ) -> str | None:
         """risk_px must be abs(E1 - SL) -- the 1R price distance the TP
         ladder was actually spaced with (Signal.extras["r_unit"]) -- NOT
@@ -195,7 +212,9 @@ class RiskGuard:
         self.trades[key] = {
             "symbol": symbol,
             "side": side,
+            "engine": str(engine),
             "timeframe": timeframe,
+            "data_source": "SIMULATED",
             "phase": "FILLING",
             "pending_entries": [[float(p), float(w)] for p, w in zip(entries, entry_weights)],
             "filled_weight": 0.0,
