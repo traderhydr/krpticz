@@ -149,9 +149,13 @@ State persists to `risk_state.json` (gitignored) next to the bot.
 `backtest.py` runs a walk-forward backtest against real historical Binance
 Futures candles and writes an `.xlsx` report (Summary / Trades / Equity
 Curve / Monthly / Notes sheets). It reuses the live strategy code directly
-(`strategy.py`, `risk_guard.py`) and the same config path
-(`bot.configure_strategy`), so it reflects what `bot.py` would actually do
-live, not a separate reimplementation.
+(`strategy.py` / `gem_strategy.py` / `kryptic_strategy.py`, `risk_guard.py`)
+and the same config path (`bot.configure_strategy` /
+`bot.configure_gem_strategy` / `bot.configure_kryptic_strategy`), so it
+reflects what `bot.py` would actually do live, not a separate
+reimplementation. `--engine` selects which engine(s) run:
+`zenith` (default) / `gem` / `kryptic` / `both` (ZENITH+GEM) / `all`
+(ZENITH+GEM+KRYPTIC).
 
 **Must be run somewhere with real internet access to `fapi.binance.com`**
 — it could not be run or timed in the sandbox this bot was developed in
@@ -160,20 +164,37 @@ indicative, not guaranteed on your machine.
 
 ```bash
 pip install -r requirements-backtest.txt
-python backtest.py --smoke                          # ~3 day / 5-symbol sanity check first
-python backtest.py --months 6 --top-n 30 --out backtest_report.xlsx
+python backtest.py --smoke                                   # ~3 day / 5-symbol sanity check first
+python backtest.py --engine all --months 6 --top-n 30 --out backtest_report.xlsx
 ```
 
-Key flags: `--months` (default 6), `--top-n` (default 30, ranked by current
-24h quote volume like the live universe), `--symbols` (comma list to
-override auto-selection), `--every` (evaluate every Nth 15m bar for a
-faster/coarser preview), `--out` (xlsx path).
+Key flags: `--engine` (see above), `--months` (default 6), `--top-n`
+(default 30, ranked by current 24h quote volume like the live universe),
+`--symbols` (comma list to override auto-selection for every running
+engine), `--every` (evaluate every Nth 15m bar for a faster/coarser
+preview), `--out` (xlsx path). `--kryptic-max-posts-per-scan` /
+`--kryptic-cooldown-minutes` / `--kryptic-min-quote-vol` /
+`--kryptic-top-n` mirror the existing `--gem-*` overrides for KRYPTIC.
+
+**KRYPTIC is much slower per bar than ZENITH/GEM**: it runs
+`TradeLifecycleManager.open_trade()` against a pandas DataFrame window per
+symbol per bar (regime filter + direction bias + entry ladder, all
+pandas-based), vs. ZENITH/GEM's pure-Python `evaluate()` functions. Including
+it (`--engine kryptic` or `all`) noticeably increases total runtime — start
+with `--smoke` or a narrower `--kryptic-top-n`/coarser `--every` before a
+full 6-month `--engine all` run.
+
+Cooldown in the backtest is per (symbol, direction) for every engine, same
+as the live bot: a same-direction repeat on a symbol is blocked until its
+cooldown window elapses, but a reversal is never blocked by it.
 
 In dev-sandbox timing with synthetic data of the same shape (real network
-access wasn't available to time it against actual Binance data), 15
-symbols x 6 months took ~30s single-threaded — a default 30-symbol x
-6-month run should land in the low minutes, scaling roughly linearly with
-symbols x months. Start with `--smoke`, then scale up.
+access wasn't available to time it against actual Binance data), ZENITH+GEM
+at 15 symbols x 6 months took ~30s single-threaded — a default 30-symbol x
+6-month `--engine both` run should land in the low minutes, scaling roughly
+linearly with symbols x months. `--engine all`/`kryptic` will run
+meaningfully slower per the KRYPTIC note above. Start with `--smoke`, then
+scale up.
 
 Known simplifications (also written into the report's Notes sheet):
 funding-rate veto isn't modeled (no historical funding pulled — a minor

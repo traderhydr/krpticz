@@ -15,7 +15,14 @@ Usage:
     python backtest.py --smoke                       # ~3 day, 5-symbol sanity check first
     python backtest.py --months 6 --top-n 30 --out backtest_report.xlsx
     python backtest.py --engine gem --months 6 --out backtest_gem.xlsx
-    python backtest.py --engine both --months 6 --out backtest_both.xlsx
+    python backtest.py --engine both --months 6 --out backtest_both.xlsx      # ZENITH + GEM
+    python backtest.py --engine all --months 6 --out backtest_all.xlsx        # ZENITH + GEM + KRYPTIC
+
+KRYPTIC (--engine kryptic / all) runs kryptic_strategy.py's
+TradeLifecycleManager.open_trade() against a pandas DataFrame window per
+symbol per bar -- much heavier per-evaluation than ZENITH/GEM's pure-Python
+evaluate() functions, so a KRYPTIC-inclusive run is noticeably slower.
+Narrow it with --kryptic-top-n or a coarser --every for a faster preview.
 
 A full 6-month x 30-symbol run evaluates on the order of ~500k symbol-bars
 in pure Python and can take a long time (the exact figure depends on your
@@ -80,6 +87,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import pandas as pd
 
 # bot._cfg() raises SystemExit without Telegram creds unless DRY_RUN is set.
 # Set the default *before* importing bot so its own .env load (which uses
@@ -88,8 +96,10 @@ os.environ.setdefault("DRY_RUN", "1")
 
 import bot  # noqa: E402
 import gem_strategy as gem  # noqa: E402
+import kryptic_strategy as kryptic  # noqa: E402
 from exchanges import load_universe  # noqa: E402
 from risk_guard import RiskGuard  # noqa: E402
+from risk_manager import TradeLifecycleManager  # noqa: E402
 from strategy import (  # noqa: E402
     build_signal,
     btc_regime_from_candles,
@@ -222,6 +232,19 @@ def evaluate_one_backtest_gem(ltf_window: list[dict]) -> dict | None:
     return result
 
 
+def evaluate_one_backtest_kryptic(
+    ltf_window: list[dict], btc_window: list[dict], trade_manager: TradeLifecycleManager,
+):
+    """Historical-data twin of bot.evaluate_one_kryptic(): no network, no
+    funding data. Builds the pandas DataFrames TradeLifecycleManager.open_trade()
+    needs directly from the same rolling windows ZENITH/GEM already slice."""
+    if len(ltf_window) < 80 or len(btc_window) < 50:
+        return None, None
+    df = kryptic.candles_to_df(ltf_window)
+    btc_df = kryptic.candles_to_df(btc_window)
+    return trade_manager.open_trade(df, btc_df, None, htf_df=None)
+
+
 async def build_universe(client: httpx.AsyncClient, cfg: dict, args: argparse.Namespace) -> tuple[list[str], dict]:
     """ZENITH's universe: top --top-n by 24h quote volume >= MIN_QUOTE_VOLUME_USD."""
     universe = await load_universe(client, cfg["min_quote_vol"])
@@ -254,6 +277,21 @@ async def build_universe_gem(client: httpx.AsyncClient, cfg: dict, args: argpars
     return syms, max_lev
 
 
+async def build_universe_kryptic(client: httpx.AsyncClient, cfg: dict, args: argparse.Namespace) -> tuple[list[str], dict]:
+    """KRYPTIC's own universe, mirroring bot.kryptic_scan_once's live universe selection."""
+    universe = await load_universe(client, cfg["kryptic_min_quote_vol"])
+    max_lev = universe.get("max_lev") or {}
+    if args.symbols.strip():
+        syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        return syms, max_lev
+    deny = cfg["denylist"]
+    tickers = [t for t in (universe.get("tickers") or []) if t["symbol"] not in deny]
+    tickers.sort(key=lambda t: t.get("quote_vol", 0), reverse=True)
+    top_n = 5 if args.smoke else cfg["kryptic_top_n"]
+    syms = [t["symbol"] for t in tickers] if top_n <= 0 else [t["symbol"] for t in tickers[:top_n]]
+    return syms, max_lev
+
+
 def _fmt_ts(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
@@ -277,8 +315,9 @@ def _progress(step: int, total: int, t0: float, risk: RiskGuard) -> None:
 
 
 async def run(args: argparse.Namespace) -> None:
-    run_zenith = args.engine in ("zenith", "both")
-    run_gem = args.engine in ("gem", "both")
+    run_zenith = args.engine in ("zenith", "both", "all")
+    run_gem = args.engine in ("gem", "both", "all")
+    run_kryptic = args.engine in ("kryptic", "all")
 
     cfg = bot._cfg()
     # Supply-side overrides: widen how many of the *already-qualifying*
@@ -305,10 +344,28 @@ async def run(args: argparse.Namespace) -> None:
         cfg["gem_min_quote_vol"] = args.gem_min_quote_vol
     if args.gem_top_n is not None:
         cfg["gem_top_n"] = args.gem_top_n
+    if args.kryptic_max_posts_per_scan is not None:
+        cfg["kryptic_max_posts_per_scan"] = args.kryptic_max_posts_per_scan
+    if args.kryptic_cooldown_minutes is not None:
+        cfg["kryptic_cooldown_min"] = args.kryptic_cooldown_minutes
+    if args.kryptic_min_quote_vol is not None:
+        cfg["kryptic_min_quote_vol"] = args.kryptic_min_quote_vol
+    if args.kryptic_top_n is not None:
+        cfg["kryptic_top_n"] = args.kryptic_top_n
 
     profile = bot.configure_strategy(cfg) if run_zenith else cfg.get("strategy_profile", "smc_lite")
     if run_gem:
         bot.configure_gem_strategy()
+    if run_kryptic:
+        bot.configure_kryptic_strategy()
+    kryptic_trade_manager = TradeLifecycleManager(
+        initial_sl_atr_mult=cfg["kryptic_initial_sl_atr_mult"],
+        tp1_atr_mult=cfg["kryptic_tp1_atr_mult"],
+        tp2_atr_mult=cfg["kryptic_tp2_atr_mult"],
+        tp3_atr_mult=cfg["kryptic_tp3_atr_mult"],
+        tp4_atr_mult=cfg["kryptic_tp4_atr_mult"],
+        tp5_atr_mult=cfg["kryptic_tp5_atr_mult"],
+    ) if run_kryptic else None
 
     if run_zenith:
         log.info(
@@ -337,6 +394,17 @@ async def run(args: argparse.Namespace) -> None:
             cfg["gem_min_quote_vol"],
             cfg["gem_top_n"],
         )
+    if run_kryptic:
+        log.info(
+            "KRYPTIC: lev=%s-%sx score(fixed)=%s max_posts_per_scan=%s cooldown_min=%s min_quote_vol=%s top_n=%s",
+            cfg["kryptic_leverage_min"],
+            cfg["kryptic_leverage_max"],
+            kryptic.KRYPTIC_CFG["SCORE"],
+            cfg["kryptic_max_posts_per_scan"],
+            cfg["kryptic_cooldown_min"],
+            cfg["kryptic_min_quote_vol"],
+            cfg["kryptic_top_n"],
+        )
 
     months = 0.1 if args.smoke else args.months
     end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -349,8 +417,10 @@ async def run(args: argparse.Namespace) -> None:
     htf_by_sym: dict[str, list[dict]] = {}
     zenith_max_lev: dict[str, int] = {}
     gem_max_lev: dict[str, int] = {}
+    kryptic_max_lev: dict[str, int] = {}
     zenith_symbols: list[str] = []
     gem_symbols: list[str] = []
+    kryptic_symbols: list[str] = []
 
     async with httpx.AsyncClient(headers=UA) as client:
         if run_zenith:
@@ -359,13 +429,18 @@ async def run(args: argparse.Namespace) -> None:
         if run_gem:
             gem_symbols, gem_max_lev = await build_universe_gem(client, cfg, args)
             log.info("GEM universe: %d symbols: %s", len(gem_symbols), ", ".join(gem_symbols))
+        if run_kryptic:
+            kryptic_symbols, kryptic_max_lev = await build_universe_kryptic(client, cfg, args)
+            log.info("KRYPTIC universe: %d symbols: %s", len(kryptic_symbols), ", ".join(kryptic_symbols))
 
-        all_symbols = sorted(set(zenith_symbols) | set(gem_symbols))
+        all_symbols = sorted(set(zenith_symbols) | set(gem_symbols) | set(kryptic_symbols))
         if not all_symbols:
             raise SystemExit("No symbols in universe — check network access / volume floors")
 
         fetch_symbols = list(all_symbols)
-        if run_zenith and cfg.get("btc_regime") and "BTCUSDT" not in fetch_symbols:
+        # KRYPTIC's RegimeFilter always needs BTC context (not gated by
+        # cfg["btc_regime"], which is a ZENITH-only knob).
+        if (run_zenith and cfg.get("btc_regime") or run_kryptic) and "BTCUSDT" not in fetch_symbols:
             fetch_symbols.append("BTCUSDT")
 
         sem = asyncio.Semaphore(args.fetch_concurrency)
@@ -389,6 +464,7 @@ async def run(args: argparse.Namespace) -> None:
     all_symbols = [s for s in all_symbols if s in ltf_by_sym]
     zenith_symbols = [s for s in zenith_symbols if s in ltf_by_sym]
     gem_symbols = [s for s in gem_symbols if s in ltf_by_sym]
+    kryptic_symbols = [s for s in kryptic_symbols if s in ltf_by_sym]
     if not all_symbols:
         raise SystemExit("No symbol had enough historical data to backtest")
     btc_htf = htf_by_sym.get("BTCUSDT")
@@ -408,11 +484,16 @@ async def run(args: argparse.Namespace) -> None:
     idx = {s: 0 for s in all_symbols}
     htf_idx = {s: 0 for s in all_symbols}
     btc_htf_idx = 0
-    sym_cooldown: dict[str, int] = {}
+    # Cooldown is per (symbol, direction) for every engine -- a repeat
+    # signal in the SAME direction on a symbol is blocked until it expires,
+    # but the OPPOSITE direction is never blocked by it (matches
+    # bot.py's live scan_once/gem_scan_once/kryptic_scan_once).
     side_cooldown: dict[str, int] = {}
-    gem_sym_cooldown: dict[str, int] = {}
+    gem_side_cooldown: dict[str, int] = {}
+    kryptic_side_cooldown: dict[str, int] = {}
     cooldown_ms = cfg["cooldown_min"] * 60 * 1000
     gem_cooldown_ms = cfg["gem_cooldown_min"] * 60 * 1000
+    kryptic_cooldown_ms = cfg["kryptic_cooldown_min"] * 60 * 1000
 
     out_path = Path(args.out)
     risk_state_path = out_path.with_name(out_path.stem + "_risk_state.json")
@@ -471,13 +552,12 @@ async def run(args: argparse.Namespace) -> None:
                     )
                     del risk.trades[key]
 
-        if run_zenith and cfg.get("btc_regime") and btc_htf:
+        btc_window: list[dict] = []
+        if (run_zenith and cfg.get("btc_regime") or run_kryptic) and btc_htf:
             while btc_htf_idx < len(btc_htf) and btc_htf[btc_htf_idx]["ts"] <= master_ts:
                 btc_htf_idx += 1
             btc_window = btc_htf[max(0, btc_htf_idx - 240) : btc_htf_idx]
-            btc_regime = btc_regime_from_candles(btc_window) if btc_window else "neutral"
-        else:
-            btc_regime = "neutral"
+        btc_regime = btc_regime_from_candles(btc_window) if (run_zenith and cfg.get("btc_regime") and btc_window) else "neutral"
 
         risk.update_pause_state(
             cfg["dd_ceiling_pct"],
@@ -494,8 +574,6 @@ async def run(args: argparse.Namespace) -> None:
         if run_zenith:
             candidates = []
             for sym in zenith_symbols:
-                if sym_cooldown.get(sym, 0) > master_ts:
-                    continue
                 i = idx[sym]
                 window = ltf_by_sym[sym][max(0, i - 240) : i]
                 if len(window) < 50:
@@ -579,7 +657,6 @@ async def run(args: argparse.Namespace) -> None:
                     )
                     if key is None:
                         continue
-                    sym_cooldown[sym] = master_ts + cooldown_ms
                     side_cooldown[f"{sym}:{sig.side}"] = master_ts + cooldown_ms
                     trade_records[key] = {
                         "key": key,
@@ -619,14 +696,14 @@ async def run(args: argparse.Namespace) -> None:
         if run_gem:
             gem_candidates = []
             for sym in gem_symbols:
-                if gem_sym_cooldown.get(sym, 0) > master_ts:
-                    continue
                 i = idx[sym]
                 window = ltf_by_sym[sym][max(0, i - 240) : i]
                 if len(window) < 50:
                     continue
                 result = evaluate_one_backtest_gem(window)
                 if not result:
+                    continue
+                if gem_side_cooldown.get(f"{sym}:{result['dir']}", 0) > master_ts:
                     continue
                 lev = leverage_from_quality(
                     result["nota"],
@@ -670,7 +747,7 @@ async def run(args: argparse.Namespace) -> None:
                     )
                     if key is None:
                         continue
-                    gem_sym_cooldown[sym] = master_ts + gem_cooldown_ms
+                    gem_side_cooldown[f"{sym}:{sig.side}"] = master_ts + gem_cooldown_ms
                     trade_records[key] = {
                         "key": key,
                         "engine": "GEM",
@@ -697,6 +774,96 @@ async def run(args: argparse.Namespace) -> None:
                         "smc_poi_near": None,
                         "smc_pd": None,
                         "smc_choch_ltf": sig.extras.get("smc_choch"),
+                        "close_ts": None,
+                        "close_reason": None,
+                        "r_realized": None,
+                        "bars_held": None,
+                        "equity_after": None,
+                    }
+
+        # 2c) KRYPTIC scan: its own universe/window, TradeLifecycleManager's
+        # RegimeFilter+DirectionEngine gate (pass/fail, no score) -- picks
+        # ranked by tightest risk_atr_multiple, same as bot.kryptic_scan_once.
+        if run_kryptic:
+            kryptic_candidates = []
+            for sym in kryptic_symbols:
+                i = idx[sym]
+                window = ltf_by_sym[sym][max(0, i - 240) : i]
+                position, diagnostics = evaluate_one_backtest_kryptic(window, btc_window, kryptic_trade_manager)
+                if position is None:
+                    continue
+                if kryptic_side_cooldown.get(f"{sym}:{position.direction}", 0) > master_ts:
+                    continue
+                lev = leverage_from_quality(
+                    kryptic.KRYPTIC_CFG["SCORE"],
+                    side=position.direction,
+                    lev_min=cfg["kryptic_leverage_min"],
+                    lev_max=cfg["kryptic_leverage_max"],
+                    ratr=diagnostics.get("risk_atr_multiple"),
+                )
+                exch_max = int(kryptic_max_lev.get(sym) or cfg["kryptic_leverage_max"])
+                if exch_max < cfg["kryptic_leverage_min"]:
+                    continue
+                lev = max(1, min(lev, exch_max, cfg["kryptic_leverage_max"]))
+                sig = kryptic.build_signal(
+                    sym, position, diagnostics,
+                    leverage=lev, timeframe=cfg["timeframe"], reference=float(window[-1]["close"]),
+                )
+                kryptic_candidates.append((diagnostics, sig, lev, sym))
+
+            if kryptic_candidates:
+                kryptic_candidates.sort(key=lambda x: float(x[0].get("risk_atr_multiple") or 999.0))
+                kryptic_picks = kryptic_candidates[: cfg["kryptic_max_posts_per_scan"]]
+
+                for diagnostics, sig, lev, sym in kryptic_picks:
+                    if not risk.can_open(sig.side, cfg):
+                        continue
+                    key = risk.open_trade(
+                        symbol=sym,
+                        side=sig.side,
+                        timeframe=cfg["timeframe"],
+                        entries=list(sig.entries),
+                        entry_weights=list(sig.entry_weights),
+                        sl=float(sig.sl),
+                        risk_px=float(sig.extras.get("r_unit") or abs(sig.entries[0] - sig.sl)),
+                        be_buffer_r=0.0,
+                        tps=list(sig.tps),
+                        tp_weights=list(sig.tp_weights),
+                        be_after_tp1=bool(sig.extras.get("be_after_tp1", True)),
+                        cancel_velas=int(sig.extras.get("cancel_velas") or cfg["cancel_velas"]),
+                        close_velas=int(sig.extras.get("close_velas") or cfg["close_velas"]),
+                        risk_equity_pct=cfg["risk_equity_pct"],
+                        last_ts=master_ts,
+                    )
+                    if key is None:
+                        continue
+                    kryptic_side_cooldown[f"{sym}:{sig.side}"] = master_ts + kryptic_cooldown_ms
+                    trade_records[key] = {
+                        "key": key,
+                        "engine": "KRYPTIC",
+                        "symbol": sym,
+                        "side": sig.side,
+                        "score": sig.score,
+                        "leverage": lev,
+                        "open_ts": master_ts,
+                        "entry_avg_intended": None,
+                        "entry_avg_filled": None,
+                        "fill_pct": None,
+                        "sl": sig.sl,
+                        "be_price": None,
+                        "tp1": sig.tps[0] if sig.tps else None,
+                        "tp5": sig.tps[-1] if sig.tps else None,
+                        "risk_pct": None,
+                        "htf_aligned": None,
+                        "vol_ratio": None,
+                        "stretch_atr": None,
+                        "impulse_vol_ratio": None,
+                        "smc_bias": None,
+                        "smc_bos": None,
+                        "smc_poi_inside": None,
+                        "smc_poi_near": None,
+                        "smc_pd": None,
+                        "smc_choch_ltf": None,
                         "close_ts": None,
                         "close_reason": None,
                         "r_realized": None,
@@ -762,6 +929,7 @@ async def run(args: argparse.Namespace) -> None:
                     "engine_mode": args.engine,
                     "zenith_symbols": zenith_symbols,
                     "gem_symbols": gem_symbols,
+                    "kryptic_symbols": kryptic_symbols,
                     "trade_records": trade_records,
                     "equity_curve": equity_curve,
                     "pause_events": pause_events,
@@ -777,7 +945,7 @@ async def run(args: argparse.Namespace) -> None:
 
     try:
         write_report(
-            args, cfg, profile, args.engine, zenith_symbols, gem_symbols,
+            args, cfg, profile, args.engine, zenith_symbols, gem_symbols, kryptic_symbols,
             trade_records, equity_curve, pause_events, start_ms, end_ms,
         )
     except Exception:
@@ -802,13 +970,13 @@ def write_report(
     engine_mode: str,
     zenith_symbols: list[str],
     gem_symbols: list[str],
+    kryptic_symbols: list[str],
     trade_records: dict[str, dict],
     equity_curve: list[dict],
     pause_events: int,
     start_ms: int,
     end_ms: int,
 ) -> None:
-    import pandas as pd
 
     trades = [dict(r) for r in trade_records.values() if r["close_ts"] is not None]
     trades.sort(key=lambda r: r["open_ts"])
@@ -910,6 +1078,13 @@ def write_report(
             ("GEM leverage band", f"{cfg['gem_leverage_min']}-{cfg['gem_leverage_max']}x"),
             ("GEM MIN_SCORE", gem.GEM_CFG["MIN_SCORE"]),
         ]
+    if kryptic_symbols:
+        summary_rows += [
+            ("KRYPTIC universe size", len(kryptic_symbols)),
+            ("KRYPTIC universe symbols", ", ".join(kryptic_symbols)),
+            ("KRYPTIC leverage band", f"{cfg['kryptic_leverage_min']}-{cfg['kryptic_leverage_max']}x"),
+            ("KRYPTIC SCORE (fixed -- feeds leverage sizing only, entry gate is pass/fail)", kryptic.KRYPTIC_CFG["SCORE"]),
+        ]
     summary_rows += [
         ("RISK_EQUITY_PCT per trade (shared)", cfg["risk_equity_pct"]),
         ("DD_CEILING_PCT / DD_RESUME_PCT (shared)", f"{cfg['dd_ceiling_pct']} / {cfg['dd_resume_pct']}"),
@@ -978,16 +1153,21 @@ def write_report(
     df_monthly = pd.DataFrame(monthly_rows)
 
     notes = [
-        "This backtest reuses the live bot's exact strategy code (strategy.py / gem_strategy.py,",
-        "risk_guard.py) and config-application path (bot.configure_strategy /",
-        "bot.configure_gem_strategy), so results reflect what bot.py would do live.",
+        "This backtest reuses the live bot's exact strategy code (strategy.py / gem_strategy.py /",
+        "kryptic_strategy.py, risk_guard.py) and config-application path (bot.configure_strategy /",
+        "bot.configure_gem_strategy / bot.configure_kryptic_strategy), so results reflect what",
+        "bot.py would do live.",
         "",
-        "When both engines ran, they shared ONE RiskGuard instance (one equity curve, one drawdown",
-        "ceiling, one MAX_CONCURRENT_TRADES/SAME_SIDE budget) exactly like the live bot -- see the",
-        "'By Engine' block in Summary for each engine's own win rate / avg R / profit factor.",
+        "When more than one engine ran, they shared ONE RiskGuard instance (one equity curve, one",
+        "drawdown ceiling, one MAX_CONCURRENT_TRADES/SAME_SIDE budget) exactly like the live bot --",
+        "see the 'By Engine' block in Summary for each engine's own win rate / avg R / profit factor.",
+        "",
+        "Cooldown is per (symbol, direction) for every engine: a same-direction repeat on a symbol",
+        "is blocked until its cooldown elapses, but a reversal (opposite direction) is never blocked",
+        "by it -- matches bot.py's live scan_once/gem_scan_once/kryptic_scan_once.",
         "",
         "Simplifications vs. a full live run:",
-        "- Funding-rate veto is not modeled for either engine (no historical funding data fetched);",
+        "- Funding-rate veto is not modeled for any engine (no historical funding data fetched);",
         "  a minor soft filter, not the core edge.",
         "- CVD/OI absorption was never modeled, live or here (stub only) -- see README.",
         "- Each engine's symbol universe is TODAY's qualifying set by 24h volume, held fixed across",
@@ -1001,6 +1181,8 @@ def write_report(
         "  when intrabar order is unknown from OHLC alone) -- same assumption risk_guard.py uses live.",
         "- This always fetches from Binance regardless of the live bot's DATA_SOURCE (e.g. blofin) --",
         "  approximates each strategy's edge, not an exact replay of a different exchange's price action.",
+        "- KRYPTIC's own entry gate (RegimeFilter + DirectionEngine) is pass/fail, not a continuous",
+        "  score -- its 'score' column is a fixed value that only feeds leverage sizing, never a filter.",
         "- Compounding caution: with hundreds of trades, small unmodeled optimism in the per-trade edge",
         "  (see above) compounds exponentially. Treat the win rate / avg R / drawdown as the signal to",
         "  trust; treat the compounded total-return figure as illustrative, not a real-world forecast.",
@@ -1030,7 +1212,10 @@ def write_report(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ZENITH + GEM walk-forward backtest -> Excel report")
-    p.add_argument("--engine", choices=["zenith", "gem", "both"], default="zenith", help="Which engine(s) to backtest")
+    p.add_argument(
+        "--engine", choices=["zenith", "gem", "kryptic", "both", "all"], default="zenith",
+        help="Which engine(s) to backtest -- 'both' is ZENITH+GEM (legacy), 'all' is ZENITH+GEM+KRYPTIC",
+    )
     p.add_argument("--months", type=float, default=6.0)
     p.add_argument("--top-n", type=int, default=30, help="ZENITH: symbols to scan by 24h volume; <= 0 means all qualifying symbols")
     p.add_argument("--symbols", type=str, default="", help="Comma list to override auto universe selection for BOTH engines")
@@ -1074,6 +1259,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gem-cooldown-minutes", type=int, default=None, help="Override GEM_COOLDOWN_MINUTES")
     p.add_argument("--gem-min-quote-vol", type=float, default=None, help="Override GEM_MIN_QUOTE_VOLUME_USD")
     p.add_argument("--gem-top-n", type=int, default=None, help="Override GEM_TOP_N; <= 0 means all qualifying symbols")
+    p.add_argument("--kryptic-max-posts-per-scan", type=int, default=None, help="Override KRYPTIC_MAX_SIGNALS_PER_SCAN")
+    p.add_argument("--kryptic-cooldown-minutes", type=int, default=None, help="Override KRYPTIC_COOLDOWN_MINUTES")
+    p.add_argument("--kryptic-min-quote-vol", type=float, default=None, help="Override KRYPTIC_MIN_QUOTE_VOLUME_USD")
+    p.add_argument("--kryptic-top-n", type=int, default=None, help="Override KRYPTIC_TOP_N; <= 0 means all qualifying symbols")
     p.add_argument(
         "--from-raw", type=str, default=None,
         help="Regenerate the Excel report from a previously-saved <out>_raw.json checkpoint instead "
@@ -1090,6 +1279,7 @@ def regenerate_from_raw(args: argparse.Namespace) -> None:
     if zenith_symbols is None:
         zenith_symbols = data.get("symbols") or []  # pre-GEM checkpoint format
     gem_symbols = data.get("gem_symbols") or []
+    kryptic_symbols = data.get("kryptic_symbols") or []
     write_report(
         args,
         data["cfg"],
@@ -1097,6 +1287,7 @@ def regenerate_from_raw(args: argparse.Namespace) -> None:
         data.get("engine_mode", "zenith"),
         zenith_symbols,
         gem_symbols,
+        kryptic_symbols,
         data["trade_records"],
         data["equity_curve"],
         data["pause_events"],
